@@ -1,0 +1,4 @@
+.renode/
+__pycache__/
+data/g1_extstore_left.bin
+data/g1_extstore_right.bin

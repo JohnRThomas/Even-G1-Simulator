@@ -1,0 +1,69 @@
+:name: Even Realities G1 (two nRF5340s)
+:description: Prepares the emulation for a pair of G1 lenses running prebuilt firmware.
+#
+# This file compiles the peripheral models and creates the radio medium the
+# two lenses share. g1_lens.resc then turns a machine into a lens; it is
+# included once for the master lens and once for the slave lens.
+#
+# Normally run through g1sim.py, which prepares the images from update zips
+# or .bin files and writes this sequence. By hand:
+#
+#   i @g1.resc
+#
+#   mach create "g1"
+#   $app_bin=@/path/app.bin
+#   $net_bin=@/path/net.bin
+#   $extstore=@/path/g1_extstore_left.bin
+#   i @g1_lens.resc
+#
+#   mach create "g1_slave"
+#   $app_bin=@/path/app.bin
+#   $net_bin=@/path/net.bin
+#   $extstore=@/path/g1_extstore_right.bin
+#   $slave=true
+#   $deviceaddr0=0x0B5BEB85
+#   $deviceaddr1=0xFFFFF265
+#   i @g1_lens.resc
+#
+#   start
+#
+# g1_lens.resc's header describes these variables.
+# The two lenses can be given different firmware.
+
+using sysbus
+path add $ORIGIN
+
+# Custom nRF5340 + board peripheral models. Order matters: NRF5340_DPPIC
+# defines the DPPI hub types that the EGU/Timer/RTC/IPC/RADIO models use.
+i @models/NRF5340_TrapStub.cs
+i @models/NRF5340_UARTE.cs
+i @models/NRF5340_CC3xx_RNG.cs
+i @models/NRF5340_ClockPowerReset.cs
+i @models/NRF5340_DPPIC.cs
+i @models/NRF5340_IPC.cs
+i @models/NRF5340_RADIO.cs
+i @models/BLE_VirtualCentral.cs
+i @models/NRF5340_AAR.cs
+i @models/NRF5340_CCM.cs
+i @models/NRF5340_TEMP.cs
+i @models/NRF5340_VREQCTRL.cs
+i @models/NRF5340_EGU.cs
+i @models/NRF5340_Timer.cs
+i @models/NRF5340_RTC.cs
+i @models/NRF5340_SPIM.cs
+i @models/JBD_Display.cs
+i @models/Macronix_MX25U.cs
+i @models/NRF5340_NVMC.cs
+i @models/NRF5340_QSPI.cs
+i @models/NRF5340_SAADC.cs
+i @models/NRF5340_PDM.cs
+i @models/GPIO_Pin_Driver.cs
+i @models/NRF5340_TWIM.cs
+i @models/ST_LSM6DSO.cs
+i @models/TI_OPT3001.cs
+i @models/Nordic_NPM1300.cs
+i @models/ST_ST25DV.cs
+i @models/G1_TouchController.cs
+
+# The radio medium the lenses of a pair (and nothing else) share.
+emulation CreateBLEMedium "wireless"

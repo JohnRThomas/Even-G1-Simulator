@@ -1,0 +1,128 @@
+:name: Even Realities G1 lens
+:description: One lens of a G1 pair: an nRF5340 with the board peripherals, running the firmware.
+#
+# Turns the current machine into a lens. Include it after g1.resc (which
+# compiles the peripheral models and creates the radio medium "wireless"),
+# once for each lens of the pair, straight after "mach create" and after
+# setting that lens's inputs:
+#
+#   $app_bin  app-core image INCLUDING its 0x200-byte MCUboot header
+#             (app_update.bin as shipped). Loaded at 0xC000, the MCUboot
+#             primary slot, so the vector table lands at 0xC200.
+#   $net_bin  net-core image WITHOUT its MCUboot header (vector table first;
+#             net_core_app_update.bin with the first 0x200 bytes removed).
+#             It is linked for 0x01008800, the slot behind the net-core
+#             bootloader.
+#   $slave    true for the slave lens of the pair; the master lens if unset.
+#   $extstore the file that holds this lens's external flash, a raw image of
+#             the 32 MiB chip. It is created if it does not exist, and
+#             everything the firmware writes goes into it at once, so the
+#             lens finds its flash as it left it the next time.
+#   $deviceaddr0, $deviceaddr1
+#             the lens's Bluetooth address as the two FICR DEVICEADDR words:
+#             the low four bytes, and 0xFFFF0000 + the high two. The two
+#             lenses of a pair need different ones. If unset, the master
+#             lens's E9:A4:9E:29:70:D9.
+#
+# Set them after "mach create": a variable set while a machine is selected
+# belongs to that machine, so each lens keeps its own images and role. The
+# reset macro below uses them again whenever the lens reboots.
+#
+# No bootloader is emulated: each core's SP/PC are taken straight from its
+# image's vector table, which is what MCUboot / b0n do after validation.
+
+using sysbus
+path add $ORIGIN
+
+$slave?=false
+$deviceaddr0?=0x9E2970D9
+$deviceaddr1?=0xFFFFE9A4
+
+# Run the two cores serially within each time quantum. In parallel, a
+# peripheral driven by one core that raises the other core's NVIC line
+# mid-quantum (IPC does this constantly) races the exception-entry handshake
+# and the target core vectors into garbage. Serial execution removes the race
+# and makes dual-core runs deterministic.
+python "from Antmicro.Renode.Core import EmulationManager; EmulationManager.Instance.CurrentEmulation.MasterTimeSource.ExecuteInSerial = True"
+
+machine LoadPlatformDescription @platform/nrf5340.repl
+connector Connect sysbus.radio wireless
+
+# Both cores run from the 64 MHz clock. Renode's default of 100 MIPS makes the
+# firmware's calibrated busy-wait loops finish early; the UART driver's
+# per-character wait then gives up before a character has left the line and
+# sleeps a millisecond instead, which slows the boot log down tenfold.
+sysbus.cpuapp PerformanceInMips 64
+sysbus.cpunet PerformanceInMips 64
+
+# JBD panel protocol as the G1 firmware speaks it: the panel ID is read on
+# received bytes 2/3 (one dummy byte after the 0x9F opcode), and the
+# pixel-window coordinate is sent big-endian.
+spim_a.jbd IdReadLatency 1
+spim_a.jbd CoordBigEndian true
+
+# A full battery. 4500 mV is above the cell's 4.4 V on purpose: the firmware
+# takes a state of charge that stays below 100% without changing for two
+# minutes as a stuck fuel gauge and stops feeding the PMIC watchdog, and the
+# modelled battery never changes.
+sysbus.twim1.npm1300 BatteryVoltageMilliVolts 4500
+sysbus.twim1.npm1300 BatteryCurrentMilliAmps 0
+
+# An expired PMIC watchdog power-cycles the lens, as on hardware. This is how
+# v1.66 firmware reboots itself: it stops feeding the watchdog and shortens
+# its timeout to 100 ms.
+sysbus.twim1.npm1300 ResetOnWatchdogExpiry true
+
+# Lying flat on a table: 1 g on the IMU's Z axis. (The model's default is no
+# gravity at all, which leaves the firmware's attitude filter drifting.) This
+# is also where the IMU model's "don" gesture starts.
+sysbus.twim2.lsm6dso AccelerationZ 1
+
+# FICR/UICR: nRF5340 reset values from the Nordic SVD, with a fixed device id.
+sysbus LoadBinary @data/ficr_app.bin 0x00FF0000
+sysbus LoadBinary @data/uicr_app.bin 0x00FF8000
+sysbus LoadBinary @data/ficr_net.bin 0x01FF0000
+sysbus LoadBinary @data/uicr_net.bin 0x01FF8000
+
+# The lens's Bluetooth address, in the net core's FICR (DEVICEADDR[0..1]).
+# The firmware takes its MAC from there; the last three bytes end the name it
+# advertises under.
+sysbus WriteDoubleWord 0x01FF02A4 $deviceaddr0
+sysbus WriteDoubleWord 0x01FF02A8 $deviceaddr1
+
+# The external QSPI NOR, as it comes if $extstore does not exist yet: erased,
+# apart from the settings area (system settings at chip offset 0x130000,
+# whitelist 0x131000, user settings 0x134000, app settings 0x13E000), which
+# is filled in as on a lens that has been through the factory, is paired with
+# a second lens on ESB channel 34 and bound to a phone. Generated by
+# g1_seed.py.
+sysbus.qspi.qspi_flash LoadSegment 0x130000 @data/g1_extstore_seed.bin
+
+# From here on the flash is the file: an existing $extstore replaces the
+# contents above, a missing one is created from them.
+sysbus.qspi.qspi_flash PersistTo $extstore
+
+# Load both images and point each core at its vector table. Renode runs the
+# macro named "reset" after every machine reset, so a firmware-initiated
+# reboot restarts the firmware instead of jumping to the (absent) bootloader.
+macro reset
+"""
+    # The role strap, P0.26: low = master lens, high = slave lens.
+    sysbus.gpio0.strap_p0_26 Set $slave
+    sysbus LoadBinary $app_bin 0x0000C000
+    cpuapp VectorTableOffset 0x0000C200
+    cpuapp SP `sysbus ReadDoubleWord 0x0000C200`
+    cpuapp PC `sysbus ReadDoubleWord 0x0000C204`
+    # The net image must sit at 0x01008800 for its absolute pointers to
+    # resolve, but on release the net core fetches SP/PC from the flash base
+    # 0x01000000 (where the net bootloader would be), so it is mirrored there.
+    # The base copy goes first: it overlaps 0x01008800 and would clobber it.
+    sysbus LoadBinary $net_bin 0x01000000
+    sysbus LoadBinary $net_bin 0x01008800
+    # Held in reset until the app core clears RESET.NETWORK.FORCEOFF.
+    cpunet IsHalted true
+    cpunet VectorTableOffset 0x01008800
+    cpunet SP `sysbus ReadDoubleWord 0x01008800`
+    cpunet PC `sysbus ReadDoubleWord 0x01008804`
+"""
+runMacro $reset

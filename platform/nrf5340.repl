@@ -1,0 +1,548 @@
+// nRF5340 SoC — dual Arm Cortex-M33 (CPUAPP + CPUNET), single machine.
+//
+// Base addresses and IRQ numbers verbatim from the pinned nRF5340 MDK/SVD
+// (hal_nordic 9784731461018d3e983604698fbbed6af2bea801):
+//   svd/nrf5340_application.svd, svd/nrf5340_network.svd
+//
+// Application peripherals are registered at both their non-secure
+// (0x4xxx_xxxx) and secure (0x5xxx_xxxx) aliases; security attribution
+// itself (SPU) is a register stub — see README for limitations.
+//
+// Serial boxes 0..3 are instantiated as UARTE. To use a box as
+// SPIM/TWIM instead, replace the model here (hardware muxes one
+// function per box via ENABLE).
+
+// ------------------------- CPUs -------------------------
+
+cpuapp: CPU.CortexM @ sysbus
+    cpuType: "cortex-m33"
+    nvic: nvic_app
+    id: 0
+
+cpunet: CPU.CortexM @ sysbus
+    cpuType: "cortex-m33"
+    nvic: nvic_net
+    id: 1
+    init:
+        IsHalted true
+
+nvic_app: IRQControllers.NVIC @ {
+        sysbus new Bus.BusPointRegistration { address: 0xE000E000; cpu: cpuapp }
+    }
+    systickFrequency: 64000000
+    -> cpuapp@0
+
+nvic_net: IRQControllers.NVIC @ {
+        sysbus new Bus.BusPointRegistration { address: 0xE000E000; cpu: cpunet }
+    }
+    systickFrequency: 64000000
+    -> cpunet@0
+
+// ------------------------- Memories -------------------------
+
+// Executable code flash, up to the internal settings_storage partition.
+// The last 16 KiB (0xFC000..0x100000) are the NVS/settings partitions and
+// are backed by NRF5340_InternalFlash instead (real erase/AND-program), so
+// Zephyr's NVS-backed settings subsystem mounts instead of failing -45.
+flash_app: Memory.MappedMemory @ sysbus 0x00000000
+    size: 0xFC000
+
+ram_app: Memory.MappedMemory @ sysbus 0x20000000
+    size: 0x80000
+
+flash_net: Memory.MappedMemory @ sysbus 0x01000000
+    size: 0x40000
+
+ram_net: Memory.MappedMemory @ sysbus 0x21000000
+    size: 0x10000
+
+ficr_app: Memory.MappedMemory @ sysbus 0x00FF0000
+    size: 0x1000
+
+uicr_app: Memory.MappedMemory @ sysbus 0x00FF8000
+    size: 0x1000
+
+ficr_net: Memory.MappedMemory @ sysbus 0x01FF0000
+    size: 0x1000
+
+uicr_net: Memory.MappedMemory @ sysbus 0x01FF8000
+    size: 0x1000
+
+// ---------------- Application core peripherals ----------------
+
+clock_app: Miscellaneous.NRF5340_ClockPowerReset @ {
+        sysbus 0x40005000;
+        sysbus 0x50005000
+    }
+    networkCore: cpunet
+    hasNetworkForceOff: true
+    -> nvic_app@5
+
+// UARTE with transmit timing (models/NRF5340_UARTE.cs): the firmware's
+// synchronous log output takes real time, which its boot sequence relies on.
+uart0: UART.NRF5340_UARTE @ {
+        sysbus 0x40008000;
+        sysbus 0x50008000
+    }
+    easyDMA: true
+    -> nvic_app@8
+
+// Serial-box 1 as TWIM (board map: I2C 400 kHz, SDA P0.05, SCL P0.04 —
+// OPT3001 @0x45, nPM1300 @0x6B, ST25DV @0x53)
+twim1: I2C.NRF5340_TWIM @ {
+        sysbus 0x40009000;
+        sysbus 0x50009000
+    }
+    label: "TWIM1"
+    -> nvic_app@9
+
+opt3001: Sensors.TI_OPT3001 @ twim1 0x45
+
+npm1300: Sensors.Nordic_NPM1300 @ twim1 0x6B
+
+// GPO (interrupt line, active low) on P1.10. The charging case is the RF
+// side: `sysbus.twim1.st25dv RfField true`, `RfEnableMailbox`,
+// `RfPutMailboxMessage "..."`.
+st25dv: Sensors.ST_ST25DV @ twim1 0x53
+    density: 4
+    GPO -> gpio1@10
+
+// ST25DV system configuration area at device address 0x57 (ST25DV_ADDR_SYST_I2C).
+// The G1 firmware reads the ST25DV *system* registers (IC_REF, UID, MEM_SIZE,
+// IC_REV) at 0x57 — eeprom_st25dv_read_sys/write_sys in the app. Without this
+// port those accesses NAK (-5). Forwards to the same st25dv device state.
+st25dv_sys: Sensors.ST_ST25DV_SystemPort @ twim1 0x57
+    target: st25dv
+
+// Dedicated SPIM4-class box (SVD instance SPIM4; the project firmware
+// labels it "SPIM2" — bind by address, do not "correct" the name).
+spim_a: SPI.NRF5340_SPIM @ {
+        sysbus 0x4000A000;
+        sysbus 0x5000A000
+    }
+    -> nvic_app@10
+
+// JBD display, default backend option A (board map). To use backend
+// option B instead, re-register this line as `@ spim_b`.
+jbd: SPI.JBD_Display @ spim_a
+
+// Serial-box 2 as TWIM (board map: I2C 400 kHz, SDA P1.02, SCL P1.03 —
+// LSM6DSO @0x6B; firmware labels this box "TWIM3")
+twim2: I2C.NRF5340_TWIM @ {
+        sysbus 0x4000B000;
+        sysbus 0x5000B000
+    }
+    label: "TWIM2"
+    -> nvic_app@11
+
+lsm6dso: Sensors.ST_LSM6DSO @ twim2 0x6B
+
+// SERIAL3 box as SPIM (SVD instance SPIM3; firmware label "SPIM4") —
+// JBD display backend option B (no device attached by default).
+spim_b: SPI.NRF5340_SPIM @ {
+        sysbus 0x4000C000;
+        sysbus 0x5000C000
+    }
+    -> nvic_app@12
+
+gpiote0: GPIOPort.NRF52840_GPIOTasksEvents @ sysbus 0x5000D000
+    port0: gpio0
+    port1: gpio1
+    -> nvic_app@13
+
+gpiote1: GPIOPort.NRF52840_GPIOTasksEvents @ sysbus 0x4002F000
+    port0: gpio0
+    port1: gpio1
+    -> nvic_app@47
+
+timer0: Timers.NRF5340_Timer @ {
+        sysbus 0x4000F000;
+        sysbus 0x5000F000
+    }
+    numberOfEvents: 6
+    dppic: dppic_app
+    -> nvic_app@15
+
+timer1: Timers.NRF5340_Timer @ {
+        sysbus 0x40010000;
+        sysbus 0x50010000
+    }
+    numberOfEvents: 6
+    dppic: dppic_app
+    -> nvic_app@16
+
+timer2: Timers.NRF5340_Timer @ {
+        sysbus 0x40011000;
+        sysbus 0x50011000
+    }
+    numberOfEvents: 6
+    dppic: dppic_app
+    -> nvic_app@17
+
+rtc0: Timers.NRF5340_RTC @ {
+        sysbus 0x40014000;
+        sysbus 0x50014000
+    }
+    numberOfEvents: 4
+    dppic: dppic_app
+    -> nvic_app@20
+
+rtc1: Timers.NRF5340_RTC @ {
+        sysbus 0x40015000;
+        sysbus 0x50015000
+    }
+    numberOfEvents: 4
+    dppic: dppic_app
+    -> nvic_app@21
+
+wdt0: Timers.NRF52840_Watchdog @ {
+        sysbus 0x40018000;
+        sysbus 0x50018000
+    }
+    -> nvic_app@24
+
+wdt1: Timers.NRF52840_Watchdog @ {
+        sysbus 0x40019000;
+        sysbus 0x50019000
+    }
+    -> nvic_app@25
+
+egu0: Miscellaneous.NRF5340_EGU @ {
+        sysbus 0x4001B000;
+        sysbus 0x5001B000
+    }
+    dppic: dppic_app
+    -> nvic_app@27
+
+egu1: Miscellaneous.NRF5340_EGU @ {
+        sysbus 0x4001C000;
+        sysbus 0x5001C000
+    }
+    dppic: dppic_app
+    -> nvic_app@28
+
+egu2: Miscellaneous.NRF5340_EGU @ {
+        sysbus 0x4001D000;
+        sysbus 0x5001D000
+    }
+    dppic: dppic_app
+    -> nvic_app@29
+
+egu3: Miscellaneous.NRF5340_EGU @ {
+        sysbus 0x4001E000;
+        sysbus 0x5001E000
+    }
+    dppic: dppic_app
+    -> nvic_app@30
+
+egu4: Miscellaneous.NRF5340_EGU @ {
+        sysbus 0x4001F000;
+        sysbus 0x5001F000
+    }
+    dppic: dppic_app
+    -> nvic_app@31
+
+egu5: Miscellaneous.NRF5340_EGU @ {
+        sysbus 0x40020000;
+        sysbus 0x50020000
+    }
+    dppic: dppic_app
+    -> nvic_app@32
+
+pdm0: Sound.NRF5340_PDM @ {
+        sysbus 0x40026000;
+        sysbus 0x50026000
+    }
+    -> nvic_app@38
+
+saadc: Analog.NRF5340_SAADC @ {
+        sysbus 0x4000E000;
+        sysbus 0x5000E000
+    }
+    -> nvic_app@14
+
+i2s0: Sound.NRF52840_I2S @ {
+        sysbus 0x40028000;
+        sysbus 0x50028000
+    }
+    -> nvic_app@40
+
+ipc_app: Miscellaneous.NRF5340_IPC @ {
+        sysbus 0x4002A000;
+        sysbus 0x5002A000
+    }
+    dppic: dppic_app
+    -> nvic_app@42
+
+gpio0: GPIOPort.NRF52840_GPIO @ {
+        sysbus 0x40842500;
+        sysbus 0x50842500;
+        sysbus 0x418C0500
+    }
+
+gpio1: GPIOPort.NRF52840_GPIO @ {
+        sysbus 0x40842800;
+        sysbus 0x50842800;
+        sysbus 0x418C0800
+    }
+
+// The touch bar: an Awinic AW93203 capacitive controller on the IMU's I2C bus
+// at 0x12, interrupt line (active low) on P1.09. Inject touches with
+// `sysbus.twim2.touch Tap` (or Press / Release).
+touch: Sensors.G1_TouchController @ twim2 0x12
+    IRQ -> gpio1@9
+
+// Board straps P0.25-P0.28: monitor-driven inputs
+// (sysbus.gpio0.strap_p0_26 SetHigh / SetLow / Toggle), low by default.
+// P0.26 selects the lens role: low = master (advertises as "_R_"), high =
+// slave. The firmware only logs the other three.
+strap_p0_25: Miscellaneous.GPIO_Pin_Driver @ gpio0 25
+    -> gpio0@25
+
+strap_p0_26: Miscellaneous.GPIO_Pin_Driver @ gpio0 26
+    -> gpio0@26
+
+strap_p0_27: Miscellaneous.GPIO_Pin_Driver @ gpio0 27
+    -> gpio0@27
+
+strap_p0_28: Miscellaneous.GPIO_Pin_Driver @ gpio0 28
+    -> gpio0@28
+
+// Register-presence stubs (models/pydev/*.py): enough for driver init.
+spu: Miscellaneous.NRF5340_TrapStub @ sysbus 0x50003000
+    label: "SPU"
+
+cache_ctrl: Miscellaneous.NRF5340_TrapStub @ sysbus 0x50001000
+    label: "CACHE"
+
+dcnf_app: Miscellaneous.NRF5340_TrapStub @ {
+        sysbus 0x40000000;
+        sysbus 0x50000000
+    }
+    label: "DCNF_FPU"
+
+osc_reg: Miscellaneous.NRF5340_TrapStub @ {
+        sysbus 0x40004000;
+        sysbus 0x50004000
+    }
+    label: "OSCILLATORS_REGULATORS"
+
+ctrlap_app: Miscellaneous.NRF5340_TrapStub @ {
+        sysbus 0x40006000;
+        sysbus 0x50006000
+    }
+    label: "CTRLAP"
+
+dppic_app: Miscellaneous.NRF5340_DPPIC @ {
+        sysbus 0x40017000;
+        sysbus 0x50017000
+    }
+
+comp: Miscellaneous.NRF5340_TrapStub @ {
+        sysbus 0x4001A000;
+        sysbus 0x5001A000
+    }
+    label: "COMP_LPCOMP"
+
+pwm0: Miscellaneous.NRF5340_TrapStub @ {
+        sysbus 0x40021000;
+        sysbus 0x50021000
+    }
+    label: "PWM0"
+
+pwm1: Miscellaneous.NRF5340_TrapStub @ {
+        sysbus 0x40022000;
+        sysbus 0x50022000
+    }
+    label: "PWM1"
+
+pwm2: Miscellaneous.NRF5340_TrapStub @ {
+        sysbus 0x40023000;
+        sysbus 0x50023000
+    }
+    label: "PWM2"
+
+pwm3: Miscellaneous.NRF5340_TrapStub @ {
+        sysbus 0x40024000;
+        sysbus 0x50024000
+    }
+    label: "PWM3"
+
+qspi: SPI.NRF5340_QSPI @ {
+        sysbus 0x4002B000;
+        sysbus 0x5002B000
+    }
+    -> nvic_app@43
+
+// Board map: Macronix MX25U25645G-family 32 MiB quad NOR on the QSPI box
+// (CSN P0.18, SCK P0.17, IO0-3 P0.13-P0.16).
+qspi_flash: SPI.Macronix_MX25U @ qspi
+
+// Execute-in-place window: flash contents visible at 0x10000000 while the
+// QSPI peripheral is activated.
+qspi_xip: SPI.NRF5340_QSPI_XIPWindow @ sysbus 0x10000000
+    controller: qspi
+
+mutex: Miscellaneous.NRF5340_TrapStub @ {
+        sysbus 0x40030000;
+        sysbus 0x50030000
+    }
+    label: "MUTEX"
+
+usbd: Miscellaneous.NRF5340_TrapStub @ {
+        sysbus 0x40036000;
+        sysbus 0x50036000
+    }
+    label: "USBD"
+
+usbreg: Miscellaneous.NRF5340_TrapStub @ {
+        sysbus 0x40037000;
+        sysbus 0x50037000
+    }
+    label: "USBREGULATOR"
+
+// Real NVMC: tracks CONFIG.WEN so the internal-flash region below can
+// distinguish page-erase (WEN=Erase) from word-program (WEN=Write).
+nvmc_app: MTD.NRF5340_NVMC @ {
+        sysbus 0x40039000;
+        sysbus 0x50039000
+    }
+
+// Internal-flash NVS/settings partitions (flash-map ids 9 and 10):
+//   id 9  settings_storage : 0xFC000, 0x2000 (Zephyr settings / BT bonds)
+//   id 10 second partition : 0xFE000, 0x2000
+// One 16 KiB region with real NOR semantics (erased 0xFF, page erase to
+// 0xFF, AND program) covers both. Erase/program are gated by nvmc_app.CONFIG.
+intflash_settings: MTD.NRF5340_InternalFlash @ sysbus 0x000FC000
+    nvmc: nvmc_app
+    size: 0x4000
+    pageSize: 0x1000
+
+vmc_app: Miscellaneous.NRF5340_TrapStub @ {
+        sysbus 0x40081000;
+        sysbus 0x50081000
+    }
+    label: "VMC_APP"
+
+cryptocell: Miscellaneous.NRF5340_TrapStub @ sysbus 0x50844000
+    label: "CRYPTOCELL"
+
+// CryptoCell CC3xx (CC-312) core: TRNG (synthetic seeded entropy so the
+// nrf_cc3xx_platform_init self-test passes instead of busy-looping in
+// startTrngHW) PLUS the symmetric AES/HASH DMA engine and HOST_RGF interrupt
+// block (real AES + SHA-256/1 datapath, HOST_IRR SYM_DMA_COMPLETED). Covers
+// both core pages (size 0x2000). See docs/g1-boot-and-trng-blocker.md and the
+// model header. Both bus aliases (secure 0x5084_5000 / non-secure 0x4084_5000).
+cc3xx_rng: Miscellaneous.NRF5340_CC3xx_RNG @ {
+        sysbus 0x40845000;
+        sysbus 0x50845000
+    }
+
+// ---------------- Network core peripherals ----------------
+
+clock_net: Miscellaneous.NRF5340_ClockPowerReset @ sysbus 0x41005000
+    -> nvic_net@5
+
+radio: Wireless.NRF5340_RADIO @ sysbus 0x41008000
+    dppic: dppic_net
+    -> nvic_net@8
+
+// Renode-side virtual BLE central ("the phone"): talks to the G1 ONLY over the
+// modeled radio PHY. Disabled by default (Enabled=false); g1sim.py --phone
+// sets `vcentral Enabled true`.
+vcentral: Wireless.BLE_VirtualCentral @ sysbus 0x42000000
+    radio: radio
+
+rng: Miscellaneous.NRF52840_RNG @ sysbus 0x41009000
+    -> nvic_net@9
+
+gpiote_net: GPIOPort.NRF52840_GPIOTasksEvents @ sysbus 0x4100A000
+    port0: gpio0
+    port1: gpio1
+    -> nvic_net@10
+
+wdt_net: Timers.NRF52840_Watchdog @ sysbus 0x4100B000
+    -> nvic_net@11
+
+timer0_net: Timers.NRF5340_Timer @ sysbus 0x4100C000
+    numberOfEvents: 8
+    dppic: dppic_net
+    -> nvic_net@12
+
+ecb: Miscellaneous.NRF52840_ECB @ sysbus 0x4100D000
+    -> nvic_net@13
+
+rtc0_net: Timers.NRF5340_RTC @ sysbus 0x41011000
+    numberOfEvents: 4
+    dppic: dppic_net
+    -> nvic_net@17
+
+ipc_net: Miscellaneous.NRF5340_IPC @ sysbus 0x41012000
+    peer: ipc_app
+    dppic: dppic_net
+    -> nvic_net@18
+
+uart_net: UART.NRF5340_UARTE @ sysbus 0x41013000
+    easyDMA: true
+    -> nvic_net@19
+
+egu0_net: Miscellaneous.NRF5340_EGU @ sysbus 0x41014000
+    dppic: dppic_net
+    -> nvic_net@20
+
+rtc1_net: Timers.NRF5340_RTC @ sysbus 0x41016000
+    numberOfEvents: 4
+    dppic: dppic_net
+    -> nvic_net@22
+
+timer1_net: Timers.NRF5340_Timer @ sysbus 0x41018000
+    numberOfEvents: 8
+    dppic: dppic_net
+    -> nvic_net@24
+
+timer2_net: Timers.NRF5340_Timer @ sysbus 0x41019000
+    numberOfEvents: 8
+    dppic: dppic_net
+    -> nvic_net@25
+
+dcnf_net: Miscellaneous.NRF5340_TrapStub @ sysbus 0x41000000
+    label: "DCNF_NET"
+
+vreqctrl: Miscellaneous.NRF5340_VREQCTRL @ sysbus 0x41004000
+
+ctrlap_net: Miscellaneous.NRF5340_TrapStub @ sysbus 0x41006000
+    label: "CTRLAP_NET"
+
+reserved_41007000: Miscellaneous.NRF5340_TrapStub @ sysbus 0x41007000
+    label: "RESERVED_41007000"
+    storeWrites: false
+
+// CCM and AAR: two SVD peripherals on one page, one hardware block —
+// modelled as one container (see models/NRF5340_CCM.cs + NRF5340_AAR.cs).
+ccm_aar: Miscellaneous.NRF5340_CCM_AAR @ sysbus 0x4100E000
+    dppic: dppic_net
+    -> nvic_net@14
+
+dppic_net: Miscellaneous.NRF5340_DPPIC @ sysbus 0x4100F000
+
+temp_net: Miscellaneous.NRF5340_TEMP @ sysbus 0x41010000
+    dppic: dppic_net
+    -> nvic_net@16
+
+nvmc_net: Miscellaneous.NRF5340_TrapStub @ sysbus 0x41080000
+    label: "NVMC_NET"
+    presets: "0x400=1;0x408=1"
+
+vmc_net: Miscellaneous.NRF5340_TrapStub @ sysbus 0x41081000
+    label: "VMC_NET"
+
+// ------------------------- Notes -------------------------
+
+sysbus:
+    init:
+        Tag <0x4002D000, 0x4002DFFF> "NFCT"
+        Tag <0x5002D000, 0x5002DFFF> "NFCT_S"
+        Tag <0x40033000, 0x40033FFF> "QDEC0"
+        Tag <0x40034000, 0x40034FFF> "QDEC1"
+        Tag <0x00F00000, 0x00F00FFF> "CACHEDATA"
+        Tag <0x00F08000, 0x00F08FFF> "CACHEINFO"
