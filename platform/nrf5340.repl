@@ -453,6 +453,12 @@ radio: Wireless.NRF5340_RADIO @ sysbus 0x41008000
 vcentral: Wireless.BLE_VirtualCentral @ sysbus 0x42000000
     radio: radio
 
+// A second virtual phone on the same radio, speaking the G2 app's protocol
+// (Even service, 0xAA frames). Disabled by default; g1sim.py --phone-g2
+// sets `vcentral_g2 Enabled true`. One phone at a time.
+vcentral_g2: Wireless.BLE_VirtualCentralG2 @ sysbus 0x42001000
+    radio: radio
+
 rng: Miscellaneous.NRF52840_RNG @ sysbus 0x41009000
     -> nvic_net@9
 

@@ -47,6 +47,10 @@
 //
 // Disabled by default: `vcentral Enabled true` switches the phone on.
 //
+// BLE_VirtualCentralG2 (BLE_VirtualCentralG2.cs) derives from this class: it
+// keeps the link layer, L2CAP, ATT and SMP and replaces the protocol on top
+// through the protected virtual members marked "hook" below.
+//
 using System;
 using System.Collections.Generic;
 using System.Globalization;
@@ -82,6 +86,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
                 link = Link.Idle;
                 haveAdv = false;
                 reconnectNotBeforeMs = 0;
+                OnLinkEnd();
             }
         }
 
@@ -196,6 +201,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
                     if(nusReady)
                     {
                         text.Append(", notifications on");
+                        text.Append(ProtocolSummary());
                     }
                     if(smp != Smp.Idle)
                     {
@@ -529,6 +535,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
             lastWriteMs = now;
             connectedAtMs = now;
             securityRequested = false;
+            OnLinkStart();
 
             Say("connected to {0}", AddressText(advA));
             // As a phone does on a new link: ask for long PDUs, then encrypt
@@ -551,6 +558,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
             smp = Smp.Idle;
             enc = Enc.None;
             reconnectNotBeforeMs = now + ReconnectDelayMs;
+            OnLinkEnd();
         }
 
         private void Terminate()
@@ -833,6 +841,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
             if(smp != Smp.WaitEncryption)
             {
                 Say("link encrypted with the bond's key");
+                OnLinkSecured();
                 return;
             }
             // Phase 3: the lens hands over its keys, then the phone its own.
@@ -999,7 +1008,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
 
         // ---------------------------------- ATT ---------------------------------
 
-        private void AttRequest(byte[] pdu, Action<byte[]> onResponse)
+        protected void AttRequest(byte[] pdu, Action<byte[]> onResponse)
         {
             attQueue.Enqueue(new AttTransaction { Request = pdu, OnResponse = onResponse });
             AttPump();
@@ -1020,11 +1029,11 @@ namespace Antmicro.Renode.Peripherals.Wireless
             var opcode = p[0];
             if(opcode == AttNotification)
             {
-                if(p.Length >= 3 && (p[1] | (p[2] << 8)) == nusTxHandle && nusTxHandle != 0)
+                if(p.Length >= 3)
                 {
-                    var packet = new byte[p.Length - 3];
-                    Array.Copy(p, 3, packet, 0, packet.Length);
-                    OnPacket(packet);
+                    var value = new byte[p.Length - 3];
+                    Array.Copy(p, 3, value, 0, value.Length);
+                    OnNotification((uint)(p[1] | (p[2] << 8)), value);
                 }
                 return;
             }
@@ -1082,9 +1091,9 @@ namespace Antmicro.Renode.Peripherals.Wireless
             SendL2cap(ChannelAtt, new byte[] { AttError, opcode, handle[0], handle[1], error });
         }
 
-        // MTU, then the Nordic UART Service: find its two characteristics by
-        // UUID, find the TX characteristic's CCC descriptor, switch
-        // notifications on.
+        // MTU, then the service (hooks WriteUuid/NotifyUuid; the Nordic UART
+        // Service here): find its two characteristics by UUID, find the notify
+        // characteristic's CCC descriptor, switch notifications on.
         private void StartGattSetup()
         {
             AttRequest(new byte[] { AttMtuReq, (byte)Mtu, (byte)(Mtu >> 8) }, response =>
@@ -1127,40 +1136,80 @@ namespace Antmicro.Renode.Peripherals.Wireless
                 }
                 foreach(var characteristic in characteristics)
                 {
-                    if(SameBytes(characteristic.Uuid, NusRxUuid))
+                    if(SameBytes(characteristic.Uuid, WriteUuid))
                     {
                         nusRxHandle = (uint)characteristic.Value;
                     }
-                    else if(SameBytes(characteristic.Uuid, NusTxUuid))
+                    else if(SameBytes(characteristic.Uuid, NotifyUuid))
                     {
                         nusTxHandle = (uint)characteristic.Value;
                     }
                 }
-                // The TX characteristic's descriptors end where the next
-                // characteristic starts.
-                var end = 0xFFFF;
-                foreach(var characteristic in characteristics)
-                {
-                    if(characteristic.Declaration > nusTxHandle && characteristic.Declaration <= end)
-                    {
-                        end = characteristic.Declaration - 1;
-                    }
-                }
                 if(nusRxHandle == 0 || nusTxHandle == 0)
                 {
-                    this.Log(LogLevel.Warning, "the lens has no Nordic UART Service ({0} characteristics found): "
-                             + "packets cannot be exchanged", characteristics.Count);
+                    this.Log(LogLevel.Warning, "the lens has no {0} ({1} characteristics found): "
+                             + "packets cannot be exchanged", ServiceName, characteristics.Count);
+                    OnServiceMissing();
                     return;
                 }
-                FindCcc((int)nusTxHandle + 1, end);
+                OnServiceFound(() => FindCcc(nusTxHandle, ServiceName + " notify characteristic", ccc =>
+                {
+                    if(ccc == 0)
+                    {
+                        return;
+                    }
+                    nusCccHandle = ccc;
+                    WriteCcc(ccc, ok =>
+                    {
+                        if(!ok)
+                        {
+                            return;
+                        }
+                        nusReady = true;
+                        lastWriteMs = NowMs;
+                        Say("{0}: write 0x{1:X4}, notify 0x{2:X4}, notifications on",
+                            ServiceName, nusRxHandle, nusTxHandle);
+                        OnTransportReady();
+                    });
+                }));
             });
         }
 
-        private void FindCcc(int from, int to)
+        // The characteristic with that value handle, as found by discovery.
+        protected Characteristic FindCharacteristic(byte[] uuid)
+        {
+            foreach(var characteristic in characteristics)
+            {
+                if(SameBytes(characteristic.Uuid, uuid))
+                {
+                    return characteristic;
+                }
+            }
+            return null;
+        }
+
+        // Find the CCC descriptor of the characteristic with that value
+        // handle (its descriptors end where the next characteristic starts)
+        // and hand its handle to found; a warning, and found(0), if it has none.
+        protected void FindCcc(uint valueHandle, string what, Action<uint> found)
+        {
+            var end = 0xFFFF;
+            foreach(var characteristic in characteristics)
+            {
+                if(characteristic.Declaration > valueHandle && characteristic.Declaration <= end)
+                {
+                    end = characteristic.Declaration - 1;
+                }
+            }
+            FindCcc((int)valueHandle + 1, end, what, found);
+        }
+
+        private void FindCcc(int from, int to, string what, Action<uint> found)
         {
             if(from > to)
             {
-                this.Log(LogLevel.Warning, "the Nordic UART TX characteristic has no CCC descriptor");
+                this.Log(LogLevel.Warning, "the {0} has no CCC descriptor", what);
+                found(0);
                 return;
             }
             // Find Information: the descriptors behind the TX value.
@@ -1175,8 +1224,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
                         var uuid = response[at + 2] | (response[at + 3] << 8);
                         if(uuid == 0x2902)
                         {
-                            nusCccHandle = (uint)last;
-                            EnableNotifications();
+                            found((uint)last);
                             return;
                         }
                         if(uuid == 0x2800 || uuid == 0x2801 || uuid == 0x2803)
@@ -1186,42 +1234,118 @@ namespace Antmicro.Renode.Peripherals.Wireless
                         }
                     }
                 }
-                FindCcc(last + 1, to);
+                FindCcc(last + 1, to, what, found);
             });
         }
 
-        private void EnableNotifications()
+        // Write 0x0001 to a CCC descriptor: notifications on.
+        protected void WriteCcc(uint ccc, Action<bool> done)
         {
-            AttRequest(new byte[] { 0x12, (byte)nusCccHandle, (byte)(nusCccHandle >> 8), 0x01, 0x00 }, response =>
+            AttRequest(new byte[] { 0x12, (byte)ccc, (byte)(ccc >> 8), 0x01, 0x00 }, response =>
             {
                 if(response[0] != 0x13)
                 {
-                    this.Log(LogLevel.Warning, "the lens refused the write that switches notifications on: {0}",
-                             Hex(response));
-                    return;
+                    this.Log(LogLevel.Warning, "the lens refused the write that switches notifications on (CCC 0x{0:X4}): {1}",
+                             ccc, Hex(response));
                 }
-                nusReady = true;
-                lastWriteMs = NowMs;
-                Say("Nordic UART Service: RX 0x{0:X4}, TX 0x{1:X4}, notifications on", nusRxHandle, nusTxHandle);
-                if(PairOnConnect && bondKey == null && !encrypted && !SecurityBusy)
-                {
-                    StartPairing();
-                }
+                done(response[0] == 0x13);
             });
         }
 
-        private void WritePacket(byte[] packet)
+        // ------------------------------- hooks ----------------------------------
+        // What a derived class changes to speak another protocol over the link.
+
+        // The service to look for, and its two characteristics: the one the
+        // phone writes protocol packets to and the one the lens notifies on.
+        protected virtual string ServiceName => "Nordic UART Service";
+        protected virtual byte[] WriteUuid => NusRxUuid;
+        protected virtual byte[] NotifyUuid => NusTxUuid;
+
+        // A link was set up (OnConnected) or is gone (Disconnected, Reset).
+        protected virtual void OnLinkStart()
+        {
+        }
+
+        protected virtual void OnLinkEnd()
+        {
+        }
+
+        // Discovery found no service: the link stays, nothing more happens.
+        protected virtual void OnServiceMissing()
+        {
+        }
+
+        // Discovery found the service; continueSetup switches its
+        // notifications on. A derived class may do something first.
+        protected virtual void OnServiceFound(Action continueSetup)
+        {
+            continueSetup();
+        }
+
+        // The link is encrypted: pairing completed, or the bond's key is in use.
+        protected virtual void OnLinkSecured()
+        {
+        }
+
+        // Notifications are on: the protocol can start. The G1 phone pairs now.
+        protected virtual void OnTransportReady()
+        {
+            if(PairOnConnect && bondKey == null && !encrypted && !SecurityBusy)
+            {
+                StartPairing();
+            }
+        }
+
+        // A notification from the lens; the one on the notify characteristic
+        // is a protocol packet.
+        protected virtual void OnNotification(uint handle, byte[] value)
+        {
+            if(handle == nusTxHandle && nusTxHandle != 0)
+            {
+                OnPacket(value);
+            }
+        }
+
+        // Once per connection event while the transport is up and no
+        // security procedure is running, after the queued packets went out.
+        protected virtual void OnTick(double now)
+        {
+        }
+
+        // HeartbeatSeconds have passed without a write.
+        protected virtual void SendHeartbeat()
+        {
+            heartbeatSent = new byte[] { 0x25, 0x06, 0x00, heartbeatSequence, 0x04, heartbeatSequence };
+            heartbeatSequence++;
+            WritePacket(heartbeatSent);
+            this.Log(LogLevel.Debug, "heartbeat {0}", Hex(heartbeatSent));
+        }
+
+        // Words for Summary once the transport is up.
+        protected virtual string ProtocolSummary()
+        {
+            return "";
+        }
+
+        // Write Command of a protocol packet to the write characteristic.
+        protected void WritePacket(byte[] packet)
+        {
+            WritePacket(packet, nusRxHandle);
+        }
+
+        // Write Command of a packet to any characteristic.
+        protected void WritePacket(byte[] packet, uint handle)
         {
             var pdu = new byte[3 + packet.Length];
             pdu[0] = 0x52;                          // Write Command
-            pdu[1] = (byte)nusRxHandle;
-            pdu[2] = (byte)(nusRxHandle >> 8);
+            pdu[1] = (byte)handle;
+            pdu[2] = (byte)(handle >> 8);
             Array.Copy(packet, 0, pdu, 3, packet.Length);
             SendL2cap(ChannelAtt, pdu);
             lastWriteMs = NowMs;
         }
 
-        private void OnPacket(byte[] packet)
+        protected virtual void OnPacket(byte[] packet)
         {
             if(heartbeatSent != null && packet.Length >= heartbeatSent.Length
                && SameBytes(heartbeatSent, Slice(packet, 0, heartbeatSent.Length)))
@@ -1259,20 +1383,18 @@ namespace Antmicro.Renode.Peripherals.Wireless
                 packetsSent++;
                 Say("tx {0}", Hex(packet));
             }
+            OnTick(now);
             if(HeartbeatSeconds > 0 && now - lastWriteMs >= HeartbeatSeconds * 1000)
             {
-                heartbeatSent = new byte[] { 0x25, 0x06, 0x00, heartbeatSequence, 0x04, heartbeatSequence };
-                heartbeatSequence++;
-                WritePacket(heartbeatSent);
-                this.Log(LogLevel.Debug, "heartbeat {0}", Hex(heartbeatSent));
+                SendHeartbeat();
             }
         }
 
         // ---------------------------------- SMP ---------------------------------
 
-        private bool SecurityBusy => smp != Smp.Idle || enc != Enc.None;
+        protected bool SecurityBusy => smp != Smp.Idle || enc != Enc.None;
 
-        private void StartPairing()
+        protected void StartPairing()
         {
             privateKey = P256.NewPrivateKey(RandomBytes(32));
             publicKey = P256.Multiply(privateKey, P256.G);
@@ -1464,6 +1586,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
             bondKey = newKey;
             smp = Smp.Idle;
             Say("pairing: complete, link encrypted, bonded");
+            OnLinkSecured();
         }
 
         // AES-CMAC (RFC 4493), which the Secure Connections functions f4, f5
@@ -1633,11 +1756,11 @@ namespace Antmicro.Renode.Peripherals.Wireless
 
         // -------------------------------- helpers -------------------------------
 
-        private double NowMs => machine.LocalTimeSource.ElapsedVirtualTime.TotalSeconds * 1000.0;
+        protected double NowMs => machine.LocalTimeSource.ElapsedVirtualTime.TotalSeconds * 1000.0;
 
         // A line for whoever watches the phone: prefixed with the emulated
         // time, which also keeps equal lines apart in the log.
-        private void Say(string format, params object[] arguments)
+        protected void Say(string format, params object[] arguments)
         {
             this.Log(LogLevel.Info, "{0}  {1}",
                      string.Format(CultureInfo.InvariantCulture, "{0,8:F2}s", NowMs / 1000.0),
@@ -1646,7 +1769,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
 
         // Reproducible: an emulation that is run twice uses the same access
         // addresses and pairs with the same keys.
-        private byte[] RandomBytes(int count)
+        protected byte[] RandomBytes(int count)
         {
             var bytes = new byte[count];
             random.NextBytes(bytes);
@@ -1665,7 +1788,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
             return true;
         }
 
-        private static bool SameBytes(byte[] a, byte[] b)
+        protected static bool SameBytes(byte[] a, byte[] b)
         {
             if(a.Length != b.Length)
             {
@@ -1681,7 +1804,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
             return true;
         }
 
-        private static byte[] Slice(byte[] source, int offset, int count)
+        protected static byte[] Slice(byte[] source, int offset, int count)
         {
             var result = new byte[count];
             Array.Copy(source, offset, result, 0, count);
@@ -1695,7 +1818,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
             return result;
         }
 
-        private static byte[] Concat(params byte[][] parts)
+        protected static byte[] Concat(params byte[][] parts)
         {
             var result = new List<byte>();
             foreach(var part in parts)
@@ -1705,7 +1828,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
             return result.ToArray();
         }
 
-        private static string Hex(byte[] bytes)
+        protected static string Hex(byte[] bytes)
         {
             return BitConverter.ToString(bytes).Replace("-", " ");
         }
@@ -1717,7 +1840,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
             return BitConverter.ToString(Reversed(address)).Replace("-", ":");
         }
 
-        private static byte[] ParseHex(string hex)
+        protected static byte[] ParseHex(string hex)
         {
             var digits = (hex ?? "").Replace(" ", "").Replace("_", "");
             if(digits.Length % 2 != 0)
@@ -1750,7 +1873,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
             public Action<byte[]> OnResponse;
         }
 
-        private class Characteristic
+        protected class Characteristic
         {
             public int Declaration;
             public int Value;
@@ -1769,7 +1892,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
         }
 
         private readonly NRF5340_RADIO radio;
-        private readonly object sync = new object();
+        protected readonly object sync = new object();
         private Random random;
         private bool enabled;
         private uint mtu = 251;
@@ -1798,7 +1921,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
 
         // encryption
         private Enc enc;
-        private bool encrypted;
+        protected bool encrypted;
         private bool txEncrypted, rxEncrypted;
         private ulong txCounter, rxCounter;
         private byte[] encKey;
@@ -1810,21 +1933,21 @@ namespace Antmicro.Renode.Peripherals.Wireless
         private List<byte> reassembly;
         private readonly Queue<AttTransaction> attQueue = new Queue<AttTransaction>();
         private AttTransaction attPending;
-        private int attMtu = DefaultAttMtu;
+        protected int attMtu = DefaultAttMtu;
         private readonly List<Characteristic> characteristics = new List<Characteristic>();
-        private bool nusReady;
-        private uint nusRxHandle, nusTxHandle, nusCccHandle;
+        protected bool nusReady;
+        protected uint nusRxHandle, nusTxHandle, nusCccHandle;
         private readonly Queue<byte[]> pendingPackets = new Queue<byte[]>();
-        private double lastWriteMs;
+        protected double lastWriteMs;
         private byte[] heartbeatSent;
         private byte heartbeatSequence;
-        private int packetsSent;
-        private int packetsReceived;
+        protected int packetsSent;
+        protected int packetsReceived;
 
         // pairing; keys and nonces most significant octet first
         private Smp smp;
         private bool securityRequested;
-        private byte[] bondKey;
+        protected byte[] bondKey;
         private byte[] newKey;
         private byte[] macKey;
         private BigInteger privateKey;
@@ -1848,8 +1971,8 @@ namespace Antmicro.Renode.Peripherals.Wireless
         private const int LlidControl = 3;
         private const int DefaultOctets = 27;
         private const byte MaxOctets = 251;
-        private const int DefaultAttMtu = 23;
-        private const int MaxPendingPackets = 64;
+        protected const int DefaultAttMtu = 23;
+        protected const int MaxPendingPackets = 64;
         private const double ReconnectDelayMs = 1000;
         private const double LengthProcedureMs = 1000;
         private const double SupervisionTimeoutMs = 2000;       // as in the CONNECT_IND

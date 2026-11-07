@@ -26,6 +26,11 @@ Delete a file to give that lens a factory-fresh flash again.
 Each lens has its own MAC, which --mac-master and --mac-slave change; the
 last three bytes end the name the lens advertises under.
 
+--phone switches on a virtual phone speaking the G1 app's protocol (Nordic
+UART Service, pairing); --phone-g2 one speaking the G2 app's protocol (the
+Even service 00002760-..., 0xAA frames with protobuf payloads, application
+level auth). One or the other: a lens takes one phone at a time.
+
 Needs Python 3 (standard library only) and Renode. Renode is taken from
 --renode, $RENODE, the copy that setup.sh puts into this folder, or PATH, in
 that order.
@@ -47,6 +52,11 @@ RESC = os.path.join(HERE, "g1.resc")
 LENS_RESC = os.path.join(HERE, "g1_lens.resc")
 MASTER, SLAVE = "g1", "g1_slave"      # machine names of the two lenses
 LENS_NAMES = {MASTER: "master", SLAVE: "slave"}
+
+# The virtual phones, peripherals of each lens's machine: the one speaking
+# the G1 app's protocol (--phone) and the one speaking the G2 app's protocol
+# (--phone-g2). Both are off unless switched on.
+PHONE_G1, PHONE_G2 = "vcentral", "vcentral_g2"
 
 # Each lens's MAC unless --mac-master / --mac-slave give another. The firmware
 # reads it from the net core's FICR and ends its advertising name with the
@@ -236,12 +246,21 @@ def for_lens(command):
     return [command]
 
 
+def phone_peripheral(args):
+    """The virtual phone the options switch on (PHONE_G1 or PHONE_G2), or
+    None. Both at once is an error: a lens holds one link to a phone."""
+    if args.phone and args.phone_g2:
+        die("--phone and --phone-g2 cannot be combined: a lens takes one phone at a time")
+    return PHONE_G2 if args.phone_g2 else PHONE_G1 if args.phone else None
+
+
 def setup_lines(firmware, args):
     """Monitor commands that create the two lenses with their firmware (see
     prepare_firmware) and apply the options every front end shares, up to
     the point where the run starts."""
     if args.mac_master == args.mac_slave:
         die("the two lenses need different MACs (--mac-master, --mac-slave)")
+    phone = phone_peripheral(args)
     lines = ["i " + monitor_path(RESC)]
     for machine, address in ((MASTER, args.mac_master), (SLAVE, args.mac_slave)):
         lens = firmware[machine]
@@ -255,10 +274,14 @@ def setup_lines(firmware, args):
                   "$deviceaddr1=0x%08X" % (0xFFFF0000 | address >> 32),
                   "i " + monitor_path(LENS_RESC)] + ANALYZERS
     lines.append('mach set "%s"' % MASTER)
-    if args.phone:                       # as the phone app: a link to each lens
+    if phone == PHONE_G2:
+        # The app talks to the right lens and only authenticates the left one;
+        # the firmware names the master lens _R_ and the slave _L_.
+        lines += for_lens('slave: %s Side "left"' % PHONE_G2)
+    if phone:                            # as the phone app: a link to each lens
         lines += ['emulation SetGlobalQuantum "%s"' % PHONE_QUANTUM,
-                  "vcentral Enabled true"]
-        lines += for_lens("slave: vcentral Enabled true")
+                  "%s Enabled true" % phone]
+        lines += for_lens("slave: %s Enabled true" % phone)
     for command in args.execute:
         lines += for_lens(command)
     return lines
@@ -354,7 +377,13 @@ def add_setup_arguments(parser):
                              "way, runs on the slave lens instead")
     parser.add_argument("--phone", action="store_true",
                         help="switch the virtual phone on: it connects to each of "
-                             "the two lenses over BLE and pairs with it")
+                             "the two lenses over BLE and pairs with it, speaking "
+                             "the G1 app's protocol")
+    parser.add_argument("--phone-g2", action="store_true",
+                        help="switch on the virtual phone that speaks the G2 app's "
+                             "protocol instead: it connects to each lens, finds the "
+                             "Even service, authenticates and does the app's bring-up "
+                             "(not together with --phone)")
     parser.add_argument("--execute", action="append", default=[], metavar="COMMAND",
                         help="Renode monitor command to run after the firmware is "
                              "loaded and before it starts (repeatable); prefix it "

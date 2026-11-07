@@ -43,6 +43,7 @@ i @models/NRF5340_DPPIC.cs
 i @models/NRF5340_IPC.cs
 i @models/NRF5340_RADIO.cs
 i @models/BLE_VirtualCentral.cs
+i @models/BLE_VirtualCentralG2.cs
 i @models/NRF5340_AAR.cs
 i @models/NRF5340_CCM.cs
 i @models/NRF5340_TEMP.cs

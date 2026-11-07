@@ -41,8 +41,9 @@ PROMPT_RE = re.compile(rb"\([^)\n]{1,64}\) $")
 # The log names the lens's machine: "g1/uart0", "g1_slave/uart0".
 UART_LINE_RE = re.compile(
     r"\[INFO\]\s+(?:(\w+)/)?(?:sysbus\.)?(uart0|uart_net):\s+(?:\[[^\]]*\]\s?)?(.*)$")
-# What a lens's virtual phone logs: "g1/vcentral: ...".
-PHONE_LINE_RE = re.compile(r"\[(?:INFO|WARNING|ERROR)\]\s+(\w+)/vcentral: (.*)$")
+# What a lens's virtual phone logs: "g1/vcentral: ..." (G1 protocol) or
+# "g1/vcentral_g2: ..." (G2 protocol).
+PHONE_LINE_RE = re.compile(r"\[(?:INFO|WARNING|ERROR)\]\s+(\w+)/vcentral(?:_g2)?: (.*)$")
 VIRT_TIME_RE = re.compile(r"Elapsed Virtual Time:\s*([0-9:.,]+)")
 BYTE_RE = re.compile(r"0x([0-9A-Fa-f]{2})\b")
 COLOUR_RE = re.compile(r"\x1b?\[(?:\d+;)*\d+m")       # log colour codes in UART text
@@ -51,7 +52,9 @@ APP_RAM = (0x20000000, 0x20080000)
 
 STRAP_PINS = (25, 26, 27, 28)
 TOUCH = "sysbus.twim2.touch"
-PHONE = "sysbus.vcentral"
+# The phone the page controls: the G1-protocol one unless the simulator was
+# started with --phone-g2 (set in main).
+PHONE = "sysbus." + g1sim.PHONE_G1
 LENSES = {"master": g1sim.MASTER, "slave": g1sim.SLAVE}
 CONSOLES = ("uart0", "uart_net", "phone", "slave_uart0", "slave_uart_net", "slave_phone")
 
@@ -432,6 +435,7 @@ class Api:
                 "phone_connected": rn.try_get(PHONE, "Connected"),
                 "phone_link": rn.try_get(PHONE, "Summary"),
                 "phone_mtu": rn.try_get(PHONE, "Mtu"),
+                "phone_authenticated": rn.try_get(PHONE, "Authenticated") if PHONE_IS_G2 else None,
                 "packets_sent": rn.try_get(PHONE, "PacketsSent"),
                 "packets_received": rn.try_get(PHONE, "PacketsReceived"),
                 "data_events": rn.try_get(PHONE, "DataEventsAnswered"),
@@ -515,14 +519,18 @@ class Api:
     def phone(self, body):
         """Act on a lens's virtual phone: switch it on or off ("enabled"),
         set the ATT MTU it asks for at its next connection ("mtu"), send a
-        protocol packet ("packet", as g1sim.parse_packet reads it), or one of
-        the actions "reconnect" and "forget" (the bond)."""
+        protocol packet ("packet", as g1sim.parse_packet reads it; for the G2
+        phone its first two bytes are the service id and the flag, the rest
+        the protobuf payload), or one of the actions "reconnect" and "forget"
+        (the bond)."""
         rn = self.renode
         lens = self.check_lens(body.get("lens", "master"))
         result = {}
         packet = None
         if "packet" in body:
             packet = g1sim.parse_packet(str(body["packet"]))
+            if PHONE_IS_G2 and len(packet) < 2:
+                raise ValueError("a G2 request is: service id, flag, protobuf bytes")
             result["sent"] = packet.hex(" ").upper()
         if "mtu" in body and not 23 <= int(body["mtu"]) <= 517:
             raise ValueError("an ATT MTU is between 23 and 517")
@@ -537,7 +545,9 @@ class Api:
             try:
                 if "action" in body:
                     rn.run("%s %s" % (PHONE, actions[body["action"]]))
-                if packet is not None:
+                if packet is not None and PHONE_IS_G2:
+                    rn.run('%s SendG2 %d %d "%s"' % (PHONE, packet[0], packet[1], packet[2:].hex()))
+                elif packet is not None:
                     rn.run('%s SendPacket "%s"' % (PHONE, packet.hex()))
             except MonitorError as error:
                 # The phone's own refusal ("the phone is switched off") is
@@ -619,7 +629,7 @@ class Handler(BaseHTTPRequestHandler):
         def work():
             api = self.api
             if path == "/":
-                page = PAGE.encode()
+                page = PAGE.replace("__PHONE_G2__", "true" if PHONE_IS_G2 else "false").encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(page)))
@@ -688,6 +698,10 @@ def main():
     parser.add_argument("--paused", action="store_true",
                         help="load the firmware but do not start it")
     args = parser.parse_args()
+
+    global PHONE, PHONE_IS_G2
+    PHONE_IS_G2 = g1sim.phone_peripheral(args) == g1sim.PHONE_G2
+    PHONE = "sysbus." + (g1sim.PHONE_G2 if PHONE_IS_G2 else g1sim.PHONE_G1)
 
     executable = g1sim.find_renode(args.renode)
     with tempfile.TemporaryDirectory(prefix="g1simweb-") as workdir:
@@ -880,6 +894,9 @@ function post(path, body, okMsg) {
 // in a column ends in the lens: "display-master", "display-slave", ...
 const LENSES = ["master", "slave"];
 
+// Whether the phone speaks the G2 app's protocol (--phone-g2) or the G1 app's.
+const PHONE_G2 = __PHONE_G2__;
+
 // [label, id, cell classes]
 const INFO_ROWS = [["Advertising name", "name", "mono"], ["Role", "role", ""],
                    ["Work mode", "workmode", "mono"], ["App core PC", "pc-app", "mono"],
@@ -894,8 +911,17 @@ const PHONE_ROWS = [["Phone", "phone", ""], ["Link", "link", ""],
                     ["Packets", "packets", "mono"], ["Connection events", "dataev", "mono"]];
 
 // Protocol packets offered in the phone's packet box; what is typed there is
-// free. The bytes come first, a comment after " - ".
-const PACKETS = [
+// free. The bytes come first, a comment after " - ". For the G2 phone a
+// packet is: service id, flag, protobuf bytes; the phone frames it.
+const PACKETS_G2 = [
+  "0x80 0x00 08 04 10 65 1a 04 08 01 10 04 - auth (magic 0x65)",
+  "0x80 0x20 08 0e 10 66 6a 00 - heartbeat",
+  "0x80 0x20 08 0c 10 67 - get device info",
+  "0x80 0x20 08 80 01 10 68 82 08 04 08 00 10 00 - time sync: 1970, UTC",
+  "0x09 0x20 08 02 10 69 22 02 08 01 - settings query: battery, firmware",
+  "0x80 0x20 08 08 10 6a - disconnect",
+];
+const PACKETS = PHONE_G2 ? PACKETS_G2 : [
   "0x29 - get brightness",
   "0x2a - get anti-shake",
   "0x2b - get work mode",
@@ -958,8 +984,8 @@ function lensColumn(lens) {
       <div><h3>Radio <span class="dim">phone, BLE</span></h3>
         <table class="kv">${rows(lens, PHONE_ROWS)}</table>
         <div class="row">
-          <label title="The virtual phone connects over BLE from the address the lens is bound to, pairs with the lens and keeps the link alive. The emulation runs slower while a phone is on."><input type="checkbox" id="peer-phone-${lens}"> phone</label>
-          <label title="The ATT MTU the phone asks for when it connects. The phone app uses 251; the firmware takes 498 or more as the start of a firmware update.">MTU <input type="number" id="phone-mtu-${lens}" min="23" max="517" value="251" style="width:5em"></label>
+          <label title="The virtual phone connects over BLE from the address the lens is bound to, ${PHONE_G2 ? "authenticates (G2 protocol, no pairing)" : "pairs with the lens"} and keeps the link alive. The emulation runs slower while a phone is on."><input type="checkbox" id="peer-phone-${lens}"> phone${PHONE_G2 ? " (G2)" : ""}</label>
+          <label title="The ATT MTU the phone asks for when it connects. The G1 app uses 251, the G2 app 512; the G1 firmware takes 498 or more as the start of a firmware update.">MTU <input type="number" id="phone-mtu-${lens}" min="23" max="517" value="${PHONE_G2 ? 512 : 251}" style="width:5em"></label>
         </div>
         <div class="row">
           <button id="phone-reconnect-${lens}" title="The phone closes the link and connects again.">reconnect</button>
@@ -978,7 +1004,7 @@ function lensColumn(lens) {
     <div class="row">
       <input type="text" id="packet-${lens}" list="packets" autocomplete="off" spellcheck="false"
              placeholder="2b" style="flex:1"
-             title="A packet for the phone to write to the lens: hex bytes, with or without 0x, e.g. 0x3e or 26 06 00 00 06 01; &quot;text&quot; in double quotes for its bytes; after &quot; - &quot; a comment. It is sent once the phone is connected and paired.">
+             title="${PHONE_G2 ? "A G2 request for the phone to frame and write to the lens: service id, flag, protobuf bytes, e.g. 0x80 0x20 08 0e 10 66 6a 00; after &quot; - &quot; a comment. It is sent once the phone is connected with notifications on." : "A packet for the phone to write to the lens: hex bytes, with or without 0x, e.g. 0x3e or 26 06 00 00 06 01; &quot;text&quot; in double quotes for its bytes; after &quot; - &quot; a comment. It is sent once the phone is connected and paired."}">
       <button id="packet-send-${lens}">send</button>
     </div>
   </section>
@@ -1422,7 +1448,9 @@ function fillLens(lens, d) {
   txt(at("mac-slave"), id.slave_mac);
 
   indicator(at("phone"), ra.phone_enabled ? !!ra.phone_connected : null,
-    !ra.phone_enabled ? "off" : ra.phone_connected ? "connected" : "not connected");
+    !ra.phone_enabled ? "off" : !ra.phone_connected ? "not connected"
+    : PHONE_G2 ? (ra.phone_authenticated ? "connected, authenticated" : "connected, not authenticated")
+    : "connected");
   txt(at("link"), ra.phone_link);
   txt(at("packets"), ra.packets_sent === null ? null
     : `${ra.packets_sent} sent, ${ra.packets_received} received`);
