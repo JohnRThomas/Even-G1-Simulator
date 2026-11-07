@@ -34,6 +34,7 @@ import argparse
 import fcntl
 import hashlib
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -60,12 +61,16 @@ EXTSTORE = {MASTER: os.path.join(HERE, "data", "g1_extstore_left.bin"),
             SLAVE: os.path.join(HERE, "data", "g1_extstore_right.bin")}
 LOCAL_RENODE = os.path.join(HERE, ".renode", "renode")
 
-# Where the Nordic UART Service sits in the firmware's GATT table: the handle
-# the virtual phone writes protocol frames to, and the one it enables
-# notifications on. These are v1.66's; v1.45 has 0x14 and 0x12. For another
-# layout override them: --execute "vcentral NusRxValueHandle 0x.."
-NUS_RX_VALUE_HANDLE = 0x15
-NUS_TX_CCC_HANDLE = 0x13
+# The emulation's time quantum: how far a core runs before the cores are
+# brought back in step. Within a quantum a core's timers can run late by up to
+# that long while another core is busy. The SoftDevice Controller checks its
+# radio timing against a timer and stops (the lens then reboots) if it finds
+# itself late by more than some tens of microseconds, which a connection with
+# a phone, with its 150 us turnarounds, would run into at Renode's default of
+# 100 us. A lens that only advertises does not, so the shorter quantum, which
+# costs about a third of the speed, is only used while a phone is switched on.
+QUANTUM = "0.0001"
+PHONE_QUANTUM = "0.00005"
 
 # G1 internal-flash layout. It is fixed by the bootloaders on the device, so
 # an image that does not fit it would not boot on real glasses either.
@@ -250,12 +255,10 @@ def setup_lines(firmware, args):
                   "$deviceaddr1=0x%08X" % (0xFFFF0000 | address >> 32),
                   "i " + monitor_path(LENS_RESC)] + ANALYZERS
     lines.append('mach set "%s"' % MASTER)
-    if args.phone or args.phone_write:
-        lines += ["vcentral NusRxValueHandle 0x%x" % NUS_RX_VALUE_HANDLE,
-                  "vcentral NusTxCccHandle 0x%x" % NUS_TX_CCC_HANDLE]
-        if args.phone_write:
-            lines.append('vcentral QueueAttWrite "%s"' % args.phone_write)
-        lines.append("vcentral Enabled true")
+    if args.phone:                       # as the phone app: a link to each lens
+        lines += ['emulation SetGlobalQuantum "%s"' % PHONE_QUANTUM,
+                  "vcentral Enabled true"]
+        lines += for_lens("slave: vcentral Enabled true")
     for command in args.execute:
         lines += for_lens(command)
     return lines
@@ -299,16 +302,37 @@ def timed_command(text):
     return time, command.strip()
 
 
-def hex_frame(text):
-    """argparse type for --phone-write: an even number of hex digits."""
-    digits = "".join(text.split())
-    try:
-        bytes.fromhex(digits)
-    except ValueError:
-        raise argparse.ArgumentTypeError("expected hex bytes, got %r" % text)
-    if not digits:
-        raise argparse.ArgumentTypeError("expected hex bytes, got nothing")
-    return digits
+PACKET_WORD_RE = re.compile(r'"([^"]*)"|([^\s,]+)')
+
+
+def parse_packet(text):
+    """The bytes of a protocol packet as it is typed:
+
+        0x3e - get burial point data
+        26 06 00 00 06 01
+        260600000601
+        0x4b "some text" 0x00
+
+    Hex bytes, each with or without 0x, separated by spaces or commas or
+    run together; text in double quotes stands for its UTF-8 bytes; a lone
+    "-" and all that follows it is a comment. Raises ValueError."""
+    packet = bytearray()
+    for quoted, word in PACKET_WORD_RE.findall(text):
+        if word == "-":
+            break
+        if not word:
+            packet += quoted.encode("utf-8")
+            continue
+        digits = word[2:] if word[:2].lower() == "0x" else word
+        if len(digits) == 1:
+            digits = "0" + digits
+        try:
+            packet += bytes.fromhex(digits)
+        except ValueError:
+            raise ValueError("not hex bytes: %r" % word)
+    if not packet:
+        raise ValueError("no bytes in %r" % text)
+    return bytes(packet)
 
 
 def mac_address(text):
@@ -329,11 +353,8 @@ def add_setup_arguments(parser):
                              "both lenses run it. A second firmware, given the same "
                              "way, runs on the slave lens instead")
     parser.add_argument("--phone", action="store_true",
-                        help="add the virtual phone, which connects to the master "
-                             "lens over BLE")
-    parser.add_argument("--phone-write", type=hex_frame, metavar="HEX",
-                        help="protocol frame the virtual phone writes once connected, "
-                             "e.g. 260600000601 (implies --phone)")
+                        help="switch the virtual phone on: it connects to each of "
+                             "the two lenses over BLE and pairs with it")
     parser.add_argument("--execute", action="append", default=[], metavar="COMMAND",
                         help="Renode monitor command to run after the firmware is "
                              "loaded and before it starts (repeatable); prefix it "

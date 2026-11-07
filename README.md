@@ -36,8 +36,7 @@ Using raw bin files:
 |---|---|
 | `--seconds N` | run N seconds of emulated time, then exit |
 | `--frame OUT.ppm` | with `--seconds`: save the master lens's display framebuffer on exit |
-| `--phone` | add the virtual phone, which connects to the master lens over BLE |
-| `--phone-write HEX` | protocol frame the phone writes once connected (implies `--phone`) |
+| `--phone` | switch the virtual phone on: it connects to each of the two lenses over BLE and pairs with it |
 | `--execute "CMD"` | Renode monitor command to run after loading, before starting (repeatable) |
 | `--at "T CMD"` | Renode monitor command to run at emulated time T seconds (repeatable) |
 | | a command starting with `slave:` runs on the slave lens |
@@ -69,8 +68,7 @@ Then navigate to: http://127.0.0.1:8340/
 |---|---|
 | `--port N` | HTTP port on 127.0.0.1 (default 8340) |
 | `--paused` | load the firmware but do not start it |
-| `--phone` | add the virtual phone, which connects to the master lens over BLE |
-| `--phone-write HEX` | protocol frame the phone writes once connected (implies `--phone`) |
+| `--phone` | switch the virtual phone on: it connects to each of the two lenses over BLE and pairs with it |
 | `--execute "CMD"` | Renode monitor command to run after loading, before starting (repeatable) |
 | | a command starting with `slave:` runs on the slave lens |
 | `--mac-master MAC` | MAC of the master lens (default `E9:A4:9E:29:70:D9`) |
@@ -86,7 +84,43 @@ touch bar while it believes the glasses are not being worn.
 
 ## Simulated Phone
 
-The simulated phone is limited at this time, it doesn't pair or process GATT requests at all. The firmware drops a phone that writes nothing for 30 seconds, so the fake phone sends a heart beat to keep the connection alive.
+Each lens has a virtual phone, off until `--phone` (both lenses, as the phone app holds a link to each) or the lens's `phone` checkbox in the browser switches it on. It is a BLE central that talks to the lens over the emulated radio; the lens's controller, host and GATT server are the firmware's own. The phone
+
+- connects from `66:55:44:33:22:11`, the address the settings seed (`g1_seed.py`) binds the lens to,
+- answers the controller's link-layer procedures and asks for 251-byte PDUs,
+- exchanges the ATT MTU (251, as the phone app does), finds the Nordic UART Service by its UUIDs and switches its notifications on,
+- pairs: LE Secure Connections, Just Works, with bonding. Until then the firmware does not answer packets,
+- writes a heartbeat packet after 10 seconds without any other write, because the firmware drops a phone it has not heard from for 30 seconds,
+- has no services of its own: the lens's search for ANCS finds nothing, as on an Android phone,
+- declines the lens's requests for other connection parameters.
+
+The bond outlives the link and a reboot of the lens: the phone encrypts its next connection with the stored key. A simulator that is started again starts with neither side bonded. If the lens closes the link or goes silent, the phone connects again at its next advertisement.
+
+In the browser, the phone has a console under the lens's UART consoles. It shows what the phone does and every packet, `tx` to the lens and `rx` from it, with the emulated time. The box under it sends a packet: pick one of the listed ones or type the bytes.
+
+```
+0x3e - get burial point data        hex bytes, with or without 0x; after " - " a comment
+26 06 00 00 06 01
+0x4b "some text" 0x00               text in double quotes stands for its bytes
+```
+
+A packet typed before the phone is connected and paired is sent as soon as it is.
+
+`MTU` is what the phone asks for at its next connection; `reconnect` makes that happen now. A notification carries three bytes less than the MTU: the firmware cannot send a longer answer at all and logs `Failed to send data over BLE connection` on its console (the 286-byte answer to `0x3e` needs an MTU of 289). The firmware takes an MTU of 498 or more as the start of a firmware update. `forget bond` makes the phone pair afresh at its next connection.
+
+From the Renode monitor the phone is `sysbus.vcentral`:
+
+| | |
+|---|---|
+| `Enabled true` | the phone's Bluetooth; switching it off closes the link |
+| `SendPacket "3E"` | write a packet, as plain hex |
+| `Mtu 251`, `HeartbeatSeconds 10`, `PairOnConnect true` | settings; with `PairOnConnect false` the phone pairs only when the lens sends a Security Request |
+| `Pair`, `ForgetBond`, `Disconnect` | |
+| `Summary`, `Connected`, `Encrypted`, `Bonded`, `AttMtu` | state |
+
+`logLevel 0 sysbus.vcentral` adds the link-layer control, L2CAP, ATT and SMP PDUs to the Renode log.
+
+While a phone is on, the emulation runs with a time quantum of 50 us instead of Renode's 100 us, which makes it about a third slower. Within a quantum a core's timers can be late by up to its length while another core is busy, and the SoftDevice Controller stops when it finds its radio timing late by more than some tens of microseconds: at 100 us a lens with a connection asserts within seconds and reboots.
 
 ## Simulated Flash Storage
 

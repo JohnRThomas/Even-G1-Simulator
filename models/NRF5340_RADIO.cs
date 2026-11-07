@@ -49,8 +49,10 @@
 //     sdk-nrf v2.5.1 subsys/esb/esb.c:51-57 (TX_RAMP_UP_TIME_US=129,
 //     RX_RAMP_UP_TIME_US=124, TX_FAST_RAMP_UP_TIME_US=40).
 //   DISABLE: TX* -> DISABLED 6 us, RX* -> DISABLED 1 us (PS tTXDIS ~4-6 us,
-//     tRXDIS ~0.5 us, rounded to whole us). TASKS_DISABLE in DISABLED
-//     re-raises EVENTS_DISABLED synchronously.
+//     tRXDIS ~0.5 us, rounded to whole us) when a shortcut or DPPI triggers
+//     it; at once when the firmware writes TASKS_DISABLE (see
+//     DisabledByFirmware). TASKS_DISABLE in DISABLED re-raises
+//     EVENTS_DISABLED synchronously.
 //   byte time per MODE: 1 Mbit modes 8 us, 2 Mbit 4 us, LR500Kbit 16 us,
 //     LR125Kbit 64 us, Ieee802154_250Kbit 32 us.
 //   preamble length from PCNF0.PLEN: 8bit=1, 16bit=2, 32bitZero=4 bytes,
@@ -297,6 +299,13 @@ namespace Antmicro.Renode.Peripherals.Wireless
                 // preamble+address remains; model that by buffering one frame
                 // for the preamble+address+header window and delivering it if
                 // the radio reaches RX within that window (see TaskStart).
+                // Only a frame the receiver would sync to: one for another
+                // address must not take the place of one that is waiting.
+                if(mode.Value != Mode.Ieee802154_250Kbit && MatchingPipe(frame) < 0)
+                {
+                    this.Log(LogLevel.Noisy, "Dropping frame that arrived in state {0}: no enabled logical address matched", radioState);
+                    return;
+                }
                 pendingFrame = frame;
                 pendingSender = sender;
                 pendingSince = machine.LocalTimeSource.ElapsedVirtualTime;
@@ -311,21 +320,14 @@ namespace Antmicro.Renode.Peripherals.Wireless
             ProcessRxFrame(frame, sender);
         }
 
-        private void ProcessRxFrame(byte[] frame, IRadio sender)
+        // The enabled logical address (pipe) a frame is addressed to, or -1.
+        private int MatchingPipe(byte[] frame)
         {
-            if(mode.Value == Mode.Ieee802154_250Kbit)
-            {
-                Receive802154Frame(frame);
-                return;
-            }
-
             var addressLength = AddressLength;
             if(frame.Length < addressLength)
             {
-                this.Log(LogLevel.Warning, "Dropping runt frame ({0} bytes, address alone is {1})", frame.Length, addressLength);
-                return;
+                return -1;
             }
-            var pipe = -1;
             for(var p = 0; p < 8; p++)
             {
                 if(!rxAddressEnabled[p].Value)
@@ -344,10 +346,27 @@ namespace Antmicro.Renode.Peripherals.Wireless
                 }
                 if(match)
                 {
-                    pipe = p;
-                    break;
+                    return p;
                 }
             }
+            return -1;
+        }
+
+        private void ProcessRxFrame(byte[] frame, IRadio sender)
+        {
+            if(mode.Value == Mode.Ieee802154_250Kbit)
+            {
+                Receive802154Frame(frame);
+                return;
+            }
+
+            var addressLength = AddressLength;
+            if(frame.Length < addressLength)
+            {
+                this.Log(LogLevel.Warning, "Dropping runt frame ({0} bytes, address alone is {1})", frame.Length, addressLength);
+                return;
+            }
+            var pipe = MatchingPipe(frame);
             if(pipe < 0)
             {
                 this.Log(LogLevel.Noisy, "Dropping frame: no enabled logical address matched");
@@ -1023,12 +1042,22 @@ namespace Antmicro.Renode.Peripherals.Wireless
             case State.TxRu:
             case State.TxIdle:
             case State.Tx:
+                if(DisabledByFirmware())
+                {
+                    FinishDisable();
+                    return;
+                }
                 radioState = State.TxDisable;
                 disableTimer.Schedule(TxDisableUs, FinishDisable);
                 return;
             case State.RxRu:
             case State.RxIdle:
             case State.Rx:
+                if(DisabledByFirmware())
+                {
+                    FinishDisable();
+                    return;
+                }
                 radioState = State.RxDisable;
                 disableTimer.Schedule(RxDisableUs, FinishDisable);
                 return;
@@ -1037,6 +1066,19 @@ namespace Antmicro.Renode.Peripherals.Wireless
                 // already on the way down
                 return;
             }
+        }
+
+        // True when TASKS_DISABLE comes from code the core is executing right
+        // now, not from a shortcut or a timer through DPPI. The radio is then
+        // disabled at once, without the few microseconds it takes: a core
+        // runs on to the next timer event that was due when it set off, so a
+        // timer armed here would not expire while the firmware spins waiting
+        // for EVENTS_DISABLED, and a controller that allows that wait only so
+        // many iterations (the SoftDevice Controller asserts after 255)
+        // would give up.
+        private bool DisabledByFirmware()
+        {
+            return machine.SystemBus.TryGetCurrentCPU(out var cpu);
         }
 
         private void FinishDisable()

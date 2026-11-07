@@ -8,8 +8,9 @@
 Starts the same emulation as g1sim.py (same firmware arguments and options)
 and serves a control page on http://127.0.0.1:8340/ with pause/resume/reset
 and one column for each lens of the pair, the master and the slave: its live
-display, touch bar, state, both UART consoles, sensor inputs, a monitor
-command box and the GPIO pins.
+display, touch bar, state, both UART consoles, the virtual phone with a box
+for the protocol packets it is to send, sensor inputs, a monitor command box
+and the GPIO pins.
 
 The server owns one headless Renode and talks to its monitor over a local
 TCP socket; UART output is read from Renode's log. It listens on the loopback
@@ -40,6 +41,8 @@ PROMPT_RE = re.compile(rb"\([^)\n]{1,64}\) $")
 # The log names the lens's machine: "g1/uart0", "g1_slave/uart0".
 UART_LINE_RE = re.compile(
     r"\[INFO\]\s+(?:(\w+)/)?(?:sysbus\.)?(uart0|uart_net):\s+(?:\[[^\]]*\]\s?)?(.*)$")
+# What a lens's virtual phone logs: "g1/vcentral: ...".
+PHONE_LINE_RE = re.compile(r"\[(?:INFO|WARNING|ERROR)\]\s+(\w+)/vcentral: (.*)$")
 VIRT_TIME_RE = re.compile(r"Elapsed Virtual Time:\s*([0-9:.,]+)")
 BYTE_RE = re.compile(r"0x([0-9A-Fa-f]{2})\b")
 COLOUR_RE = re.compile(r"\x1b?\[(?:\d+;)*\d+m")       # log colour codes in UART text
@@ -48,8 +51,9 @@ APP_RAM = (0x20000000, 0x20080000)
 
 STRAP_PINS = (25, 26, 27, 28)
 TOUCH = "sysbus.twim2.touch"
+PHONE = "sysbus.vcentral"
 LENSES = {"master": g1sim.MASTER, "slave": g1sim.SLAVE}
-CONSOLES = ("uart0", "uart_net", "slave_uart0", "slave_uart_net")
+CONSOLES = ("uart0", "uart_net", "phone", "slave_uart0", "slave_uart_net", "slave_phone")
 
 
 class MonitorError(Exception):
@@ -238,7 +242,8 @@ class Renode:
         return value if isinstance(value, int) else None
 
     # UART output: the session attaches Renode's logging analyzer to both
-    # UARTs, so every completed line shows up in the log.
+    # UARTs, so every completed line shows up in the log. So does what the
+    # virtual phones report.
     def poll_log(self):
         with self.log_lock:
             with open(self.log_path, "r", errors="replace") as f:
@@ -252,6 +257,11 @@ class Renode:
                 if match:
                     name = ("slave_" if match.group(1) == g1sim.SLAVE else "") + match.group(2)
                     self.uart_lines[name].append(COLOUR_RE.sub("", match.group(3)))
+                    continue
+                match = PHONE_LINE_RE.search(line)
+                if match:
+                    name = ("slave_" if match.group(1) == g1sim.SLAVE else "") + "phone"
+                    self.uart_lines[name].append(match.group(2))
 
     def uart_since(self, cursor):
         self.poll_log()
@@ -418,10 +428,13 @@ class Api:
                 "touches": identity["touches"],
             },
             "radio": {
-                "phone_enabled": rn.try_get("sysbus.vcentral", "Enabled"),
-                "phone_connected": rn.try_get("sysbus.vcentral", "Connected"),
-                "connect_inds": rn.try_get("sysbus.vcentral", "ConnectIndsSent"),
-                "data_events": rn.try_get("sysbus.vcentral", "DataEventsAnswered"),
+                "phone_enabled": rn.try_get(PHONE, "Enabled"),
+                "phone_connected": rn.try_get(PHONE, "Connected"),
+                "phone_link": rn.try_get(PHONE, "Summary"),
+                "phone_mtu": rn.try_get(PHONE, "Mtu"),
+                "packets_sent": rn.try_get(PHONE, "PacketsSent"),
+                "packets_received": rn.try_get(PHONE, "PacketsReceived"),
+                "data_events": rn.try_get(PHONE, "DataEventsAnswered"),
             },
             "straps": {str(pin): rn.try_get("sysbus.gpio0.strap_p0_%d" % pin, "State") is True
                        for pin in STRAP_PINS},
@@ -499,15 +512,51 @@ class Api:
         else:
             raise ValueError("unknown injection %r" % (what,))
 
-    def phone(self, enabled, lens="master"):
-        """Switch a lens's virtual phone on or off."""
-        rn, enabled = self.renode, bool(enabled)
-        with rn.on(self.check_lens(lens)):
-            if enabled:                      # as g1sim.py --phone
-                rn.set("sysbus.vcentral", "NusRxValueHandle", g1sim.NUS_RX_VALUE_HANDLE)
-                rn.set("sysbus.vcentral", "NusTxCccHandle", g1sim.NUS_TX_CCC_HANDLE)
-            rn.set("sysbus.vcentral", "Enabled", enabled)
-        return {}
+    def phone(self, body):
+        """Act on a lens's virtual phone: switch it on or off ("enabled"),
+        set the ATT MTU it asks for at its next connection ("mtu"), send a
+        protocol packet ("packet", as g1sim.parse_packet reads it), or one of
+        the actions "reconnect" and "forget" (the bond)."""
+        rn = self.renode
+        lens = self.check_lens(body.get("lens", "master"))
+        result = {}
+        packet = None
+        if "packet" in body:
+            packet = g1sim.parse_packet(str(body["packet"]))
+            result["sent"] = packet.hex(" ").upper()
+        if "mtu" in body and not 23 <= int(body["mtu"]) <= 517:
+            raise ValueError("an ATT MTU is between 23 and 517")
+        actions = {"reconnect": "Disconnect", "forget": "ForgetBond"}
+        if "action" in body and body["action"] not in actions:
+            raise ValueError("unknown phone action %r" % (body["action"],))
+        with rn.on(lens):
+            if "mtu" in body:
+                rn.set(PHONE, "Mtu", int(body["mtu"]))
+            if "enabled" in body:
+                rn.set(PHONE, "Enabled", bool(body["enabled"]))
+            try:
+                if "action" in body:
+                    rn.run("%s %s" % (PHONE, actions[body["action"]]))
+                if packet is not None:
+                    rn.run('%s SendPacket "%s"' % (PHONE, packet.hex()))
+            except MonitorError as error:
+                # The phone's own refusal ("the phone is switched off") is
+                # the last line of what the monitor prints.
+                if not rn.alive():
+                    raise
+                raise ValueError("phone: " + str(error).strip().splitlines()[-1])
+        if "enabled" in body:
+            self.set_quantum()
+        return result
+
+    def set_quantum(self):
+        """The shorter time quantum while a phone is on (see g1sim.QUANTUM)."""
+        rn, phones = self.renode, 0
+        for lens in LENSES:
+            with rn.on(lens):
+                phones += rn.try_get(PHONE, "Enabled") is True
+        rn.run('emulation SetGlobalQuantum "%s"'
+               % (g1sim.PHONE_QUANTUM if phones else g1sim.QUANTUM))
 
     def control(self, action):
         rn = self.renode
@@ -612,7 +661,7 @@ class Handler(BaseHTTPRequestHandler):
                 "/api/press": lambda: api.press(body.get("id"), body.get("action"),
                                                 body.get("lens", "master")),
                 "/api/inject": lambda: api.inject(body),
-                "/api/phone": lambda: api.phone(body.get("enabled"), body.get("lens", "master")),
+                "/api/phone": lambda: api.phone(body),
             }
             if self.path not in routes:
                 self.reply({"ok": False, "error": "not found"}, 404)
@@ -747,6 +796,7 @@ pre.console { background: #0d1014; border: 1px solid var(--panel-edge); border-r
               height: 220px; overflow-y: auto; margin: 0; padding: 8px;
               font-family: var(--mono); font-size: 12px; white-space: pre-wrap; word-break: break-all; }
 pre.cmd-out { height: 120px; }
+pre.phone-out { height: 160px; }
 .row { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin: 6px 0; }
 .row label { display: flex; align-items: center; gap: 5px; }
 .slider-row { display: grid; grid-template-columns: 70px 1fr 90px; gap: 10px;
@@ -840,8 +890,41 @@ const POWER_ROWS = [["Battery", "battery", "mono"], ["Case battery", "case", "mo
                     ["Ship mode", "ship", ""]];
 const ESB_ROWS = [["ESB channel", "channel", "mono"], ["ESB address bytes", "addresses", "mono"],
                   ["Master MAC", "mac-master", "mono small"], ["Slave MAC", "mac-slave", "mono small"]];
-const PHONE_ROWS = [["Phone", "phone", ""], ["CONNECT_INDs sent", "conninds", "mono"],
-                    ["Connection events", "dataev", "mono"]];
+const PHONE_ROWS = [["Phone", "phone", ""], ["Link", "link", ""],
+                    ["Packets", "packets", "mono"], ["Connection events", "dataev", "mono"]];
+
+// Protocol packets offered in the phone's packet box; what is typed there is
+// free. The bytes come first, a comment after " - ".
+const PACKETS = [
+  "0x29 - get brightness",
+  "0x2a - get anti-shake",
+  "0x2b - get work mode",
+  "0x2c 0x01 - get device info, phone is Android",
+  "0x2c 0x02 - get device info, phone is iOS",
+  "0x2d - get MAC",
+  "0x2e - get notification whitelist",
+  "0x32 - get head-up angle",
+  "0x33 - get glasses serial number",
+  "0x34 - get device serial number",
+  "0x35 - get ESB channel",
+  "0x36 - get notification count",
+  "0x37 - get time since boot",
+  "0x38 - get ANCS enable",
+  "0x39 0x05 0x00 0x00 0x01 - get running app",
+  "0x3a - get wear detection",
+  "0x3b - get raster config",
+  "0x3c - get notification auto display",
+  "0x3e - get burial point data",
+  "0x3f 0x05 - get hardware setting: double-tap action",
+  "0x3f 0x06 - get hardware setting: luminance coefficient",
+  "0x3f 0x07 - get hardware setting: long press",
+  "0x3f 0x08 - get hardware setting: microphone on head-up",
+  "0x25 0x06 0x00 0x01 0x04 0x01 - heartbeat",
+  "0x27 0x01 - set wear detection on",
+  "0x27 0x00 - set wear detection off",
+  "0x4d 0xfb - set MTU, the app session is established",
+  "0x47 - unpair: the lens drops its bond and disconnects",
+];
 
 function rows(lens, list) {
   return list.map(([label, id, cls]) =>
@@ -875,7 +958,12 @@ function lensColumn(lens) {
       <div><h3>Radio <span class="dim">phone, BLE</span></h3>
         <table class="kv">${rows(lens, PHONE_ROWS)}</table>
         <div class="row">
-          <label title="The virtual phone connects over BLE from the address the lens is bound to."><input type="checkbox" id="peer-phone-${lens}"> phone</label>
+          <label title="The virtual phone connects over BLE from the address the lens is bound to, pairs with the lens and keeps the link alive. The emulation runs slower while a phone is on."><input type="checkbox" id="peer-phone-${lens}"> phone</label>
+          <label title="The ATT MTU the phone asks for when it connects. The phone app uses 251; the firmware takes 498 or more as the start of a firmware update.">MTU <input type="number" id="phone-mtu-${lens}" min="23" max="517" value="251" style="width:5em"></label>
+        </div>
+        <div class="row">
+          <button id="phone-reconnect-${lens}" title="The phone closes the link and connects again.">reconnect</button>
+          <button id="phone-forget-${lens}" title="The phone forgets its bond with the lens: at its next connection it pairs again.">forget bond</button>
         </div></div>
     </div>
   </section>
@@ -885,6 +973,14 @@ function lensColumn(lens) {
     <pre class="console" id="${uart("uart0")}"></pre>
     <h3>Net core console <span class="dim">uart_net</span></h3>
     <pre class="console" id="${uart("uart_net")}"></pre>
+    <h3>Phone <span class="dim">packets to and from the lens</span></h3>
+    <pre class="console phone-out" id="${uart("phone")}"></pre>
+    <div class="row">
+      <input type="text" id="packet-${lens}" list="packets" autocomplete="off" spellcheck="false"
+             placeholder="2b" style="flex:1"
+             title="A packet for the phone to write to the lens: hex bytes, with or without 0x, e.g. 0x3e or 26 06 00 00 06 01; &quot;text&quot; in double quotes for its bytes; after &quot; - &quot; a comment. It is sent once the phone is connected and paired.">
+      <button id="packet-send-${lens}">send</button>
+    </div>
   </section>
 
   <section class="panel">
@@ -935,6 +1031,15 @@ function lensColumn(lens) {
 }
 
 $("columns").innerHTML = LENSES.map(lensColumn).join("");
+
+const packetList = document.createElement("datalist");
+packetList.id = "packets";
+packetList.append(...PACKETS.map(packet => {
+  const option = document.createElement("option");
+  option.value = packet;
+  return option;
+}));
+document.body.append(packetList);
 
 /* ------------------------------ display ------------------------------ */
 
@@ -992,7 +1097,7 @@ async function pollDisplay() {
 
 /* ------------------------------ consoles ----------------------------- */
 
-const consoles = ["uart0", "uart_net", "slave_uart0", "slave_uart_net"];
+const consoles = ["uart0", "uart_net", "phone", "slave_uart0", "slave_uart_net", "slave_phone"];
 const cursors = Object.fromEntries(consoles.map(name => [name, 0]));
 
 async function pollUart() {
@@ -1126,6 +1231,24 @@ function wireLens(lens) {
     post("/api/phone", { enabled: phone.checked, lens },
          `${lens} lens: phone ` + (phone.checked ? "on" : "off"))
       .catch(() => { phone.checked = !phone.checked; }));
+  el("phone-mtu").addEventListener("change", () =>
+    post("/api/phone", { mtu: +el("phone-mtu").value, lens },
+         `${lens} lens: the phone asks for an MTU of ${el("phone-mtu").value} when it next connects`)
+      .catch(() => {}));
+  for (const action of ["reconnect", "forget"])
+    el("phone-" + action).onclick = () =>
+      post("/api/phone", { action, lens }, `${lens} lens: phone ` +
+           (action === "forget" ? "forgot its bond" : "reconnecting")).catch(() => {});
+
+  function sendPacket() {
+    const packet = el("packet").value.trim();
+    if (!packet) return;
+    post("/api/phone", { packet, lens })
+      .then(d => setStatus(`${lens} lens: phone sends ${d.sent}`))
+      .catch(() => {});
+  }
+  el("packet-send").onclick = sendPacket;
+  el("packet").addEventListener("keydown", e => { if (e.key === "Enter") sendPacket(); });
 
   for (const axis of ["x", "y", "z"]) {
     slider(el("accel"), "a" + axis, -4, 4, 0.01, axis === "z" ? 1 : 0,
@@ -1299,10 +1422,13 @@ function fillLens(lens, d) {
   txt(at("mac-slave"), id.slave_mac);
 
   indicator(at("phone"), ra.phone_enabled ? !!ra.phone_connected : null,
-    !ra.phone_enabled ? "off" : ra.phone_connected ? "connected" : "waiting for advertising");
-  txt(at("conninds"), ra.connect_inds);
+    !ra.phone_enabled ? "off" : ra.phone_connected ? "connected" : "not connected");
+  txt(at("link"), ra.phone_link);
+  txt(at("packets"), ra.packets_sent === null ? null
+    : `${ra.packets_sent} sent, ${ra.packets_received} received`);
   txt(at("dataev"), ra.data_events);
   follow(at("peer-phone"), ra.phone_enabled);
+  if (document.activeElement !== $(at("phone-mtu")) && ra.phone_mtu) $(at("phone-mtu")).value = ra.phone_mtu;
   if (lens === "master" && d.head && Date.now() > headHeld) showHead(d.head);
   for (const pin of [25, 26, 27, 28]) follow(`strap-${pin}-${lens}`, d.straps[pin]);
 }
