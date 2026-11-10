@@ -39,6 +39,7 @@ Using raw bin files:
 |---|---|
 | `--seconds N` | run N seconds of emulated time, then exit |
 | `--frame OUT.ppm` | with `--seconds`: save the master lens's display framebuffer on exit |
+| `--frames DIR` | record every frame of each lens's display into `DIR/master.frames` and `DIR/slave.frames` (see [Frame Recording](#frame-recording)) |
 | `--phone` | switch the virtual phone on: it connects to each of the two lenses over BLE and pairs with it (G1 app protocol) |
 | `--phone-g2` | switch on the virtual phone that speaks the G2 app's protocol instead (see below); not with `--phone` |
 | `--execute "CMD"` | Renode monitor command to run after loading, before starting (repeatable) |
@@ -80,6 +81,24 @@ Then navigate to: http://127.0.0.1:8340/
 | `--mac-slave MAC` | MAC of the slave lens (default `F2:65:0B:5B:EB:85`) |
 | | the firmware sets the top two bits of the first byte; the last three bytes end the advertised name |
 | `--renode PATH` | Renode executable (otherwise `$RENODE`, `.renode/`, `PATH`) |
+
+## Frame Recording
+
+`--frames DIR` records what each lens's panel shows over the whole run, not only at its end as `--frame` does: after every completed pixel-window write (each time the display model's `FrameCounter` goes up) one line is appended to `DIR/master.frames` or `DIR/slave.frames`:
+
+```
+<emulated time s> <frame#> <x> <y> <w> <h> <sha1> <framebuffer>
+<emulated time s> <frame#> same
+```
+
+- `x y w h` is the bounding box of the pixels the write covered; the firmware mostly writes one row per window.
+- `<framebuffer>` is the whole 640x480 framebuffer at 4 bits per pixel (153600 bytes, two pixels per byte, the left pixel in the high nibble), compressed with raw deflate (RFC 1951, no zlib header: `zlib.decompress(data, -15)` in Python) and base64-encoded; `<sha1>` is the SHA-1 of the uncompressed framebuffer.
+- A write that leaves the framebuffer as it was in the previous line gives a `same` line. The first line of a recording is always a full one.
+- `<frame#>` starts again at 1 when the lens reboots; the recording goes on.
+
+A 30 s boot with the dashboard shown is about 21000 lines and 1.2 MB per lens. In the Renode monitor the same is `spim_a.jbd RecordFrames @/path/master.frames` and `spim_a.jbd StopRecording` (prefix `slave:` on the command line, or `mach set "g1_slave"`, for the slave lens).
+
+From the monitor the display model also has `FrameCounter`, `DumpFrame @out.ppm`, `GetJournal` (the last 1024 panel commands with their emulated time and payload; pixel windows count, so read it before the dashboard floods it), `ClearJournal` and `FaultWrongId`.
 
 ## Touch
 
@@ -184,6 +203,12 @@ of its images are reloaded and its firmware starts again, while the other
 lens keeps running. QSPI contents survive; RAM is not cleared, unlike on
 hardware. `--execute "sysbus.twim1.npm1300 ResetOnWatchdogExpiry false"`
 makes a reboot only log a warning instead.
+
+## Random Numbers
+
+The net core's random number generator reads Renode's pseudo-random number generator, which `g1sim.py` starts from a fixed seed (`PRNG_SEED`). A run is therefore reproducible: the same firmware and command give the same UART output and frames, at the same emulated times, whatever the host load. `--execute "emulation SetSeed N"` picks another seed; the log says which one a run used (`Pseudorandom Number Generator was created with seed: N`).
+
+The seed decides the radio schedule (the Bluetooth controller draws on the RNG), and with it what the link between the lenses does once the phone connects. If the master's ESB timeslots then keep opening before the slave's, the master's packet in each of them goes unheard, the firmware's ESB settings do not retransmit it within the timeslot, and the link stays down: the master logs `sync to slave failed` from then on and no dashboard is shown. With the phone switched on at 12 s, 2 seeds in 12 did this; if a run does, another seed avoids it. An `--at` command stops and restarts the emulation, which restarts the random number sequence, so adding or moving one can change the outcome too.
 
 ## Battery
 

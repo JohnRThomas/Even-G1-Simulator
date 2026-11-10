@@ -53,13 +53,36 @@
 //   GetFramebufferRowHex n  - one 320-byte row as hex
 //   GetPixel x y            - single pixel value 0..15
 //   GetJournal / JournalCount / ClearJournal - command journal
+//   RecordFrames "path"     - from now on, append one line to the file after
+//                             every completed pixel-window write (see below)
+//   StopRecording           - close that file
+//
+// Frame recording. After every completed pixel-window write (each time
+// FrameCounter goes up) RecordFrames appends one line:
+//
+//   <virtual time s> <frame#> <x> <y> <w> <h> <sha1> <framebuffer>
+//
+// x y w h is the bounding box of the pixels the write covered (a write that
+// runs past the end of a row covers whole rows). <framebuffer> is the full
+// 640x480 4-bpp framebuffer (153600 bytes, two pixels per byte, the left
+// pixel in the high nibble unless FirstPixelInLowNibble) compressed with raw
+// deflate (RFC 1951, no zlib header) and base64-encoded; <sha1> is the SHA-1
+// of the uncompressed framebuffer in hex. If the framebuffer is the same as in
+// the previous line, the line is only "<virtual time s> <frame#> same". The
+// first line after RecordFrames is always a full one. When the lens reboots
+// FrameCounter starts again at 0 (the next line is frame 1); the recording
+// goes on.
 //
 // Fault injection (default off):
 //   FaultWrongId - the 0x9F response bytes are bit-inverted.
 //
 using System;
 using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.IO.Compression;
 using System.Linq;
+using System.Security.Cryptography;
 using System.Text;
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Logging;
@@ -67,7 +90,7 @@ using Antmicro.Renode.Peripherals;
 
 namespace Antmicro.Renode.Peripherals.SPI
 {
-    public class JBD_Display : ISPIPeripheral
+    public class JBD_Display : ISPIPeripheral, IDisposable
     {
         public JBD_Display(IMachine machine)
         {
@@ -83,7 +106,15 @@ namespace Antmicro.Renode.Peripherals.SPI
             journalDropped = 0;
             FrameCounter = 0;
             FaultWrongId = false;
+            // The framebuffer was just cleared: the next recorded line has to
+            // say so, whatever was written before.
+            framebufferChanged = true;
             ResetFrameState();
+        }
+
+        public void Dispose()
+        {
+            StopRecording();
         }
 
         public byte Transmit(byte data)
@@ -165,9 +196,12 @@ namespace Antmicro.Renode.Peripherals.SPI
                 // pixel of each such row is lost, on the panel as here; its
                 // window writes with a trailing dummy byte put that byte's
                 // first nibble one pixel past the window.
+                var lastNibble = hasPendingPixelByte;
                 if(hasPendingPixelByte)
                 {
-                    framebuffer[writeOffset] = (byte)((pendingPixelByte & 0xF0) | (framebuffer[writeOffset] & 0x0F));
+                    var merged = (byte)((pendingPixelByte & 0xF0) | (framebuffer[writeOffset] & 0x0F));
+                    framebufferChanged |= merged != framebuffer[writeOffset];
+                    framebuffer[writeOffset] = merged;
                     hasPendingPixelByte = false;
                 }
                 FrameCounter++;
@@ -176,6 +210,7 @@ namespace Antmicro.Renode.Peripherals.SPI
                         pixelX, pixelY, pixelBytesWritten));
                 this.Log(LogLevel.Info, "pixel window done: x={0} y={1} {2} pixel bytes, frame #{3}",
                     pixelX, pixelY, pixelBytesWritten, FrameCounter);
+                RecordFrame(lastNibble);
                 break;
 
             case State.PixelCoord:
@@ -267,6 +302,28 @@ namespace Antmicro.Renode.Peripherals.SPI
             }
             this.Log(LogLevel.Info, "framebuffer (frame #{0}) dumped to {1}", FrameCounter, path);
             return string.Format("frame #{0} -> {1}", FrameCounter, path);
+        }
+
+        // Start appending a line per completed pixel-window write to the file
+        // at path (created or truncated); see the header comment.
+        public void RecordFrames(string path)
+        {
+            StopRecording();
+            recorder = new StreamWriter(path, false, new UTF8Encoding(false));
+            recorder.AutoFlush = true;
+            lastRecordedSha1 = null;
+            this.Log(LogLevel.Info, "recording frames to {0}", path);
+        }
+
+        public void StopRecording()
+        {
+            if(recorder != null)
+            {
+                recorder.Flush();
+                recorder.Dispose();
+                recorder = null;
+                this.Log(LogLevel.Info, "frame recording stopped");
+            }
         }
 
         public string GetFramebufferBase64()
@@ -388,9 +445,67 @@ namespace Antmicro.Renode.Peripherals.SPI
 
         private void CommitPixelByte(byte value)
         {
+            framebufferChanged |= framebuffer[writeOffset] != value;
             framebuffer[writeOffset] = value;
             writeOffset = (writeOffset + 1) % framebuffer.Length;
             pixelBytesWritten++;
+        }
+
+        // Appends the line for the pixel window that just completed to the
+        // recording, if one is open. lastNibble: the window ended with the
+        // high nibble of one more byte (see FinishTransmission).
+        private void RecordFrame(bool lastNibble)
+        {
+            if(recorder == null)
+            {
+                return;
+            }
+            var time = machine.LocalTimeSource.ElapsedVirtualTime.TotalSeconds.ToString("F6", CultureInfo.InvariantCulture);
+            string sha1 = null;
+            if(framebufferChanged || lastRecordedSha1 == null)
+            {
+                using(var hash = SHA1.Create())
+                {
+                    sha1 = string.Concat(hash.ComputeHash(framebuffer).Select(b => b.ToString("x2")));
+                }
+            }
+            framebufferChanged = false;
+            if(sha1 == null || sha1 == lastRecordedSha1)
+            {
+                recorder.WriteLine("{0} {1} same", time, FrameCounter);
+                return;
+            }
+            lastRecordedSha1 = sha1;
+
+            // Bounding box of the pixels written, from the linear pixel range.
+            var firstPixel = (pixelY * BytesPerRow + pixelX / 2) * 2;
+            var endPixel = firstPixel + pixelBytesWritten * 2 + (lastNibble ? 1 : 0);
+            endPixel = Math.Min(Math.Max(endPixel, firstPixel + 1), Width * Height);
+            var firstRow = firstPixel / Width;
+            var lastRow = (endPixel - 1) / Width;
+            int x, w;
+            if(firstRow == lastRow)
+            {
+                x = firstPixel % Width;
+                w = endPixel - firstPixel;
+            }
+            else
+            {
+                x = 0;
+                w = Width;
+            }
+
+            string packed;
+            using(var compressed = new MemoryStream())
+            {
+                using(var deflate = new DeflateStream(compressed, CompressionLevel.Optimal, true))
+                {
+                    deflate.Write(framebuffer, 0, framebuffer.Length);
+                }
+                packed = Convert.ToBase64String(compressed.GetBuffer(), 0, (int)compressed.Length);
+            }
+            recorder.WriteLine("{0} {1} {2} {3} {4} {5} {6} {7}",
+                time, FrameCounter, x, firstRow, w, lastRow - firstRow + 1, sha1, packed);
         }
 
         private string FormatPayload()
@@ -456,6 +571,9 @@ namespace Antmicro.Renode.Peripherals.SPI
         private bool hasPendingPixelByte;
         private ulong journalSequence;
         private ulong journalDropped;
+        private StreamWriter recorder;
+        private string lastRecordedSha1;
+        private bool framebufferChanged;
 
         private readonly byte[] coordBytes = new byte[3];
         private readonly byte[] framebuffer = new byte[BytesPerRow * Height];

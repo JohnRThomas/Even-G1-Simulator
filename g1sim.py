@@ -26,6 +26,11 @@ Delete a file to give that lens a factory-fresh flash again.
 Each lens has its own MAC, which --mac-master and --mac-slave change; the
 last three bytes end the name the lens advertises under.
 
+--frames DIR records every frame each lens's display shows: a line per
+completed pixel-window write, with the emulated time and the whole
+framebuffer, in DIR/master.frames and DIR/slave.frames (the line format is
+described in models/JBD_Display.cs).
+
 --phone switches on a virtual phone speaking the G1 app's protocol (Nordic
 UART Service, pairing); --phone-g2 one speaking the G2 app's protocol (the
 Even service 00002760-..., 0xAA frames with protobuf payloads, application
@@ -84,6 +89,15 @@ LOCAL_RENODE = os.path.join(HERE, ".renode", "renode.exe" if os.name == "nt" els
 # costs about a third of the speed, is only used while a phone is switched on.
 QUANTUM = "0.0001"
 PHONE_QUANTUM = "0.00005"
+
+# The seed of Renode's pseudo-random number generator, which the net core's
+# RNG peripheral reads. Renode otherwise picks a new seed in every process;
+# the Bluetooth controller draws on the RNG, so the radio schedule, and with
+# it whether the lenses' ESB link survives the phone connecting, differed
+# between two runs of the same command. With a fixed seed the same firmware
+# and command give the same UART output and frames every time, whatever the
+# host load; --execute 'emulation SetSeed N' picks another.
+PRNG_SEED = 1
 
 # G1 internal-flash layout. It is fixed by the bootloaders on the device, so
 # an image that does not fit it would not boot on real glasses either.
@@ -267,7 +281,7 @@ def setup_lines(firmware, args):
     if args.mac_master == args.mac_slave:
         die("the two lenses need different MACs (--mac-master, --mac-slave)")
     phone = phone_peripheral(args)
-    lines = ["i " + monitor_path(RESC)]
+    lines = ["i " + monitor_path(RESC), "emulation SetSeed %d" % PRNG_SEED]
     for machine, address in ((MASTER, args.mac_master), (SLAVE, args.mac_slave)):
         lens = firmware[machine]
         # Set after "mach create", so that they are the lens's own.
@@ -293,8 +307,23 @@ def setup_lines(firmware, args):
     return lines
 
 
+def frame_recording(directory, command):
+    """Monitor commands that run a display command on both lenses: "RecordFrames"
+    into DIR/master.frames and DIR/slave.frames, or "StopRecording"."""
+    lines = []
+    for machine in (MASTER, SLAVE):
+        line = "spim_a.jbd " + command
+        if command == "RecordFrames":
+            line += " " + monitor_path(os.path.join(directory, LENS_NAMES[machine] + ".frames"))
+        lines += for_lens(("slave: " if machine == SLAVE else "") + line)
+    return lines
+
+
 def write_session(firmware, workdir, args):
     lines = setup_lines(firmware, args)
+    if args.frames:
+        os.makedirs(args.frames, exist_ok=True)
+        lines += frame_recording(args.frames, "RecordFrames")
     if args.seconds is not None:
         # Nobody is watching a timed run: let it go faster than real time,
         # which Renode otherwise holds the emulation back to.
@@ -312,6 +341,8 @@ def write_session(firmware, workdir, args):
             lines.append('emulation RunFor "%s"' % (args.seconds - now))
         if args.frame:
             lines.append("spim_a.jbd DumpFrame " + monitor_path(args.frame))   # the master's
+        if args.frames:
+            lines += frame_recording(args.frames, "StopRecording")
         lines.append("quit")
     session = os.path.join(workdir, "session.resc")
     with open(session, "w") as f:
@@ -414,6 +445,9 @@ def main():
     parser.add_argument("--frame", metavar="OUT.ppm",
                         help="with --seconds: save the master lens's display "
                              "framebuffer on exit")
+    parser.add_argument("--frames", metavar="DIR",
+                        help="record every frame of each lens's display into "
+                             "DIR/master.frames and DIR/slave.frames")
     parser.add_argument("--at", action="append", default=[], type=timed_command,
                         metavar="'SECONDS COMMAND'",
                         help="Renode monitor command to run at that emulated time "
