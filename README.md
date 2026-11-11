@@ -13,6 +13,9 @@ Requirements: Python 3 and [Renode](https://renode.io) 1.16 or newer.
 
 `setup.sh` installs Renode 1.16.1 for Linux x86_64, on other systems install Renode yourself.
 
+On Windows x64, run `setup.bat` instead, and start the scripts with `python`, e.g.
+`python g1sim.py dfu_application.zip`.
+
 ## Running firmware in cli
 
 Using a zipped Zephyr DFU package with `app_update.bin`, `net_core_app_update.bin`, and `manifest.json`:

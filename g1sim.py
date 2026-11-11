@@ -36,7 +36,10 @@ Needs Python 3 (standard library only) and Renode. Renode is taken from
 that order.
 """
 import argparse
-import fcntl
+try:
+    import fcntl
+except ImportError:                       # Windows
+    fcntl = None
 import hashlib
 import os
 import re
@@ -69,7 +72,7 @@ DEFAULT_MAC = {MASTER: "E9:A4:9E:29:70:D9", SLAVE: "F2:65:0B:5B:EB:85"}
 # a missing file from the settings seed and writes every change through.
 EXTSTORE = {MASTER: os.path.join(HERE, "data", "g1_extstore_left.bin"),
             SLAVE: os.path.join(HERE, "data", "g1_extstore_right.bin")}
-LOCAL_RENODE = os.path.join(HERE, ".renode", "renode")
+LOCAL_RENODE = os.path.join(HERE, ".renode", "renode.exe" if os.name == "nt" else "renode")
 
 # The emulation's time quantum: how far a core runs before the cores are
 # brought back in step. Within a quantum a core's timers can run late by up to
@@ -205,7 +208,7 @@ def find_renode(explicit):
             if not os.path.isfile(candidate):
                 die("Renode not found at " + candidate)
             return candidate
-    die("Renode not found. Run ./setup.sh, or install Renode 1.16+ and put it "
+    die("Renode not found. Run ./setup.sh (setup.bat on Windows), or install Renode 1.16+ and put it "
         "on PATH or in $RENODE.")
 
 
@@ -215,12 +218,15 @@ def extstore(machine):
     two of them writing one flash would leave neither with what it wrote."""
     path, who = EXTSTORE[machine], LENS_NAMES[machine]
     if os.path.isfile(path) and os.path.getsize(path):
-        with open(path, "rb") as f:
-            try:
-                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError:
-                die("%s, the %s lens's flash, is in use by another running simulator"
-                    % (path, who))
+        try:
+            if fcntl:
+                with open(path, "rb") as f:
+                    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            else:                         # Windows: an open file cannot be renamed
+                os.rename(path, path)
+        except OSError:
+            die("%s, the %s lens's flash, is in use by another running simulator"
+                % (path, who))
         print("g1sim: %s lens flash: %s, kept from an earlier run" % (who, path))
     else:
         print("g1sim: %s lens flash: %s, new" % (who, path))

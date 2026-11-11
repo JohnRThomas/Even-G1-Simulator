@@ -584,7 +584,7 @@ class Api:
             rn.mark("----- reset -----")
             rn.command("start")
         elif action == "quit":
-            os.kill(os.getpid(), signal.SIGINT)
+            signal.raise_signal(signal.SIGINT)   # os.kill would terminate outright on Windows
         else:
             raise ValueError("unknown action %r" % (action,))
         return {}
