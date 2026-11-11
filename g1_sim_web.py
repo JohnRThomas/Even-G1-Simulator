@@ -16,9 +16,16 @@ The server owns one headless Renode and talks to its monitor over a local
 TCP socket; UART output is read from Renode's log. It listens on the loopback
 interface only: the page can run any Renode monitor command.
 
+The displays are drawn from each lens's frame recording, the one g1sim.py
+--frames makes, kept in the temporary directory. It is read as the display
+model writes it, and once a file has grown past FRAME_FILE_BYTES the model is
+switched to a new one and the old one deleted (see FrameFeed).
+
 Python 3, standard library only. Uses g1sim.py and g1_state.py next to it.
 """
 import argparse
+import base64
+import hashlib
 import json
 import os
 import re
@@ -29,6 +36,7 @@ import sys
 import tempfile
 import threading
 import time
+import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import g1sim
@@ -57,6 +65,15 @@ TOUCH = "sysbus.twim2.touch"
 PHONE = "sysbus." + g1sim.PHONE_G1
 LENSES = {"master": g1sim.MASTER, "slave": g1sim.SLAVE}
 CONSOLES = ("uart0", "uart_net", "phone", "slave_uart0", "slave_uart_net", "slave_phone")
+
+# The panel: 640x480 pixels of 4 bits.
+DISPLAY_WIDTH = 640
+FRAMEBUFFER_BYTES = DISPLAY_WIDTH * 480 // 2
+# Once a lens's frame recording file has grown past this, the display model
+# is switched to a new file and the old one deleted.
+FRAME_FILE_BYTES = 1 << 20
+# How often the recordings are read, whether or not a page is watching.
+FRAME_POLL_SECONDS = 0.05
 
 
 class MonitorError(Exception):
@@ -301,13 +318,167 @@ class _LensContext:
             self.renode.lock.release()
 
 
+# What a lens shows before its recording has a line: the model starts with a
+# cleared framebuffer, as a reset leaves it.
+# (window writes, emulated time, SHA-1, framebuffer deflated and in base64)
+BLANK = (0, None, hashlib.sha1(bytes(FRAMEBUFFER_BYTES)).hexdigest(), None)
+
+
+class FrameFeed:
+    """One lens's display as its display model records it (RecordFrames, the
+    recording g1sim.py --frames makes): after every completed pixel-window
+    write a line with the frame number and emulated time, and, if the write
+    changed the framebuffer, the whole framebuffer, deflated.
+
+    The model appends to a file; poll() reads what was appended since it last
+    looked and keeps the latest framebuffer. Once the file has grown past
+    FRAME_FILE_BYTES, poll() has the model go on in a new one, reads the old
+    one to its end and deletes it, so a lens has about one such file at a
+    time. The first line in each file is a full one."""
+
+    def __init__(self, renode, lens, directory):
+        self.renode, self.lens, self.directory = renode, lens, directory
+        self.number = 0                  # of the file being recorded into
+        self.offset = 0                  # how far that file has been read
+        self.partial = b""               # the start of a line not yet complete
+        self.retry = 0.0                 # after a failed switch, when to try again
+        self.reading = threading.Lock()
+        # Replaced as a whole, so that the page's requests need no lock.
+        self.latest = BLANK
+        self.decoded = (BLANK[2], None)  # (SHA-1, framebuffer in base64)
+
+    def path(self, number):
+        return os.path.join(self.directory, "%s.%d.frames" % (self.lens, number))
+
+    def record_command(self, number):
+        return "sysbus.spim_a.jbd RecordFrames " + g1sim.monitor_path(self.path(number))
+
+    def start_lines(self):
+        """Monitor commands for the session script that start the recording."""
+        prefix = "slave: " if self.lens == "slave" else ""
+        return g1sim.for_lens(prefix + self.record_command(0))
+
+    def poll(self):
+        with self.reading:
+            self._read(self.path(self.number))
+            if self.offset >= FRAME_FILE_BYTES and time.monotonic() >= self.retry:
+                self._next_file()
+
+    def blank(self):
+        """The lens was reset, which clears its framebuffer. The recording
+        says so only at the next window write."""
+        with self.reading:
+            self.latest = BLANK
+
+    def _read(self, path):
+        try:
+            with open(path, "rb") as f:
+                f.seek(self.offset)
+                data = f.read()
+        except OSError:                  # not created yet; or held up on Windows
+            return
+        if not data:
+            return
+        self.offset += len(data)
+        lines = (self.partial + data).split(b"\n")
+        self.partial = lines.pop()
+        # "<time> <frame#> same" or "<time> <frame#> <x> <y> <w> <h> <sha1>
+        # <framebuffer>": only the last line and the last full one matter.
+        frame, sim_time, sha1, packed = self.latest
+        last = None
+        for line in reversed(lines):
+            fields = line.split(b" ", 7)
+            if len(fields) < 3:
+                continue
+            if last is None:
+                last = fields
+            if len(fields) == 8:
+                sha1, packed = fields[6].decode("ascii", "replace"), fields[7].strip()
+                break
+        if last is not None:
+            try:
+                frame, sim_time = int(last[1]), float(last[0])
+            except ValueError:
+                pass
+        self.latest = (frame, sim_time, sha1, packed)
+
+    def _next_file(self):
+        rn, old = self.renode, self.path(self.number)
+        try:
+            with rn.on(self.lens):
+                rn.run(self.record_command(self.number + 1))
+        except MonitorError:
+            # Renode is gone, or refused: keep reading this file for now.
+            self.retry = time.monotonic() + 5.0
+            return
+        # The model closed the old file before it opened the new one, so what
+        # is in the old one now is all it will hold.
+        self._read(old)
+        self.number += 1
+        self.offset, self.partial = 0, b""
+        current = os.path.basename(self.path(self.number))
+        for name in os.listdir(self.directory):   # also any not deleted before
+            if name.startswith(self.lens + ".") and name.endswith(".frames") and name != current:
+                try:
+                    os.remove(os.path.join(self.directory, name))
+                except OSError:
+                    pass                 # still open somewhere: next time
+
+    def display(self, have=None):
+        """The latest frame, as the page draws it; without the framebuffer if
+        its SHA-1 is have, the one the page already shows."""
+        frame, sim_time, sha1, packed = self.latest
+        result = {"frame": frame, "time": sim_time, "sha1": sha1, "width": DISPLAY_WIDTH}
+        if sha1 != have:
+            decoded = self.decoded
+            if decoded[0] != sha1 or decoded[1] is None:
+                raw = (bytes(FRAMEBUFFER_BYTES) if packed is None
+                       else zlib.decompress(base64.b64decode(packed), -15))
+                decoded = self.decoded = (sha1, base64.b64encode(raw).decode("ascii"))
+            result["framebuffer"] = decoded[1]
+        return result
+
+
+class Frames:
+    """The FrameFeed of each lens, and the thread that polls them whether or
+    not a page is watching, which is what keeps their files small."""
+
+    def __init__(self, renode, directory):
+        os.makedirs(directory, exist_ok=True)
+        self.feeds = {lens: FrameFeed(renode, lens, directory) for lens in LENSES}
+        self.stopping = threading.Event()
+        self.thread = threading.Thread(target=self._run, name="frames", daemon=True)
+
+    def start_lines(self):
+        return [line for feed in self.feeds.values() for line in feed.start_lines()]
+
+    def start(self):
+        self.thread.start()
+
+    def stop(self):
+        self.stopping.set()
+        if self.thread.is_alive():
+            self.thread.join()
+
+    def poll(self):
+        for feed in self.feeds.values():
+            feed.poll()
+
+    def blank(self):
+        for feed in self.feeds.values():
+            feed.blank()
+
+    def _run(self):
+        while not self.stopping.wait(FRAME_POLL_SECONDS):
+            self.poll()
+
+
 class Api:
-    def __init__(self, renode, firmware):
+    def __init__(self, renode, firmware, frames):
         self.renode = renode
         # lens -> what it runs, as g1sim.prepare_firmware describes it
         self.firmware = {lens: firmware[machine] for lens, machine in LENSES.items()}
-        self.frames = {}                    # lens -> (key, framebuffer)
-        self.resets = 0
+        self.frames = frames
 
     def check_lens(self, lens):
         if lens not in LENSES:
@@ -334,15 +505,9 @@ class Api:
             "log": rn.log_path,
         }
 
-    def display(self, lens="master"):
-        rn = self.renode
-        with rn.on(self.check_lens(lens)):
-            counter = rn.get("sysbus.spim_a.jbd", "FrameCounter")
-            key = (self.resets, counter)
-            if self.frames.get(lens, (None, None))[0] != key:   # something was drawn
-                self.frames[lens] = (key, rn.command(
-                    "sysbus.spim_a.jbd GetFramebufferBase64", timeout=30).strip().strip('"'))
-        return {"frame": counter, "width": 640, "framebuffer": self.frames[lens][1]}
+    def display(self, lens="master", have=None):
+        """From the frame recording: no monitor command."""
+        return self.frames.feeds[self.check_lens(lens)].display(have)
 
     def gpio(self, lens="master"):
         """The GPIO ports' OUT, IN and DIR registers of one lens."""
@@ -576,11 +741,14 @@ class Api:
             rn.command("start")
         elif action == "reset":
             rn.command("pause")
+            # What was drawn before the reset, so that it cannot turn up
+            # after the blank display the reset leaves.
+            self.frames.poll()
             for lens in LENSES:
                 with rn.on(lens):
                     rn.command("machine Reset")
                     rn.command("runMacro $reset")    # reloads the images, re-points the cores
-            self.resets += 1
+            self.frames.blank()
             rn.mark("----- reset -----")
             rn.command("start")
         elif action == "quit":
@@ -641,7 +809,7 @@ class Handler(BaseHTTPRequestHandler):
                     {name: int(params.get(name, 0)) for name in CONSOLES})
                 return {"cursor": cursor, "lines": lines}
             if path == "/api/display":
-                return api.display(params.get("lens", "master"))
+                return api.display(params.get("lens", "master"), params.get("have"))
             if path == "/api/gpio":
                 return api.gpio(params.get("lens", "master"))
             routes = {"/api/state": api.state, "/api/lens": api.lens}
@@ -709,14 +877,17 @@ def main():
         for lens in firmware.values():
             # Where each image keeps the state the page shows.
             lens["state"] = g1_state.locate(lens["app_bin"])
-        lines = g1sim.setup_lines(firmware, args)
+        session = os.path.join(workdir, "session.resc")
+        renode = Renode(executable, session, os.path.join(workdir, "renode.log"))
+        frames = Frames(renode, os.path.join(workdir, "frames"))
+        # The recording starts before the firmware does, so that it has
+        # everything the firmware draws.
+        lines = g1sim.setup_lines(firmware, args) + frames.start_lines()
         if not args.paused:
             lines.append("start")
-        session = os.path.join(workdir, "session.resc")
         with open(session, "w") as f:
             f.write("\n".join(lines) + "\n")
 
-        renode = Renode(executable, session, os.path.join(workdir, "renode.log"))
         print("g1_sim_web: starting Renode ...", flush=True)
         try:
             renode.start()
@@ -726,7 +897,7 @@ def main():
                 sys.stderr.write("".join(f.readlines()[-25:]))
             sys.exit("g1_sim_web: %s (end of the Renode log is above)" % e)
 
-        Handler.api = Api(renode, firmware)
+        Handler.api = Api(renode, firmware, frames)
         Handler.renode = renode
         Handler.hosts = ("127.0.0.1:%d" % args.port, "localhost:%d" % args.port)
         try:
@@ -741,9 +912,11 @@ def main():
         signal.signal(signal.SIGTERM, stop)
         print("g1_sim_web: http://127.0.0.1:%d/   (Ctrl-C to stop; Renode log: %s)"
               % (args.port, renode.log_path), flush=True)
+        frames.start()
         try:
             server.serve_forever()
         finally:
+            frames.stop()                   # before Renode, whose files it reads
             renode.shutdown()
             server.server_close()
     return 0
@@ -1069,15 +1242,19 @@ document.body.append(packetList);
 
 /* ------------------------------ display ------------------------------ */
 
+// The server reads each lens's frame recording and sends the framebuffer only
+// when its SHA-1 is not the one shown.
 function lensDisplay(lens) {
   const canvas = $("display-" + lens), ctx = canvas.getContext("2d");
-  let imageData = null, lastFrame = null;
+  let imageData = null, shown = "";
   return async function () {
     try {
-      const d = await api("/api/display?lens=" + lens);
-      $("frames-" + lens).textContent = d.frame + " window writes";
-      if (d.framebuffer === lastFrame) return;
-      lastFrame = d.framebuffer;
+      const d = await api(`/api/display?lens=${lens}&have=${shown}`);
+      const label = $("frames-" + lens);
+      label.textContent = d.frame + " window writes";
+      label.title = d.time === null ? "" : `the last at ${d.time.toFixed(3)} s emulated time`;
+      if (d.framebuffer === undefined) return;
+      shown = d.sha1;
       const raw = atob(d.framebuffer);
       const height = Math.floor(raw.length * 2 / d.width);
       if (!imageData || imageData.width !== d.width || imageData.height !== height) {
@@ -1470,11 +1647,11 @@ async function pollLens() {
 /* ------------------------------ pollers ------------------------------ */
 
 // Each poller waits for its answer before asking again, so a slow one
-// (a changed frame is 150 kB) cannot pile requests up.
+// (a changed frame is 200 kB) cannot pile requests up.
 function every(ms, poll) {
   (async function loop() { await poll(); setTimeout(loop, ms); })();
 }
-every(500, pollDisplay);
+every(100, pollDisplay);       // no monitor command, and little to send unless it changed
 every(500, pollUart);
 every(1000, pollState);
 every(1000, pollGpio);

@@ -54,7 +54,9 @@
 //   GetPixel x y            - single pixel value 0..15
 //   GetJournal / JournalCount / ClearJournal - command journal
 //   RecordFrames "path"     - from now on, append one line to the file after
-//                             every completed pixel-window write (see below)
+//                             every completed pixel-window write (see below);
+//                             during a recording, closes its file and goes on
+//                             in the new one (also while the emulation runs)
 //   StopRecording           - close that file
 //
 // Frame recording. After every completed pixel-window write (each time
@@ -305,24 +307,33 @@ namespace Antmicro.Renode.Peripherals.SPI
         }
 
         // Start appending a line per completed pixel-window write to the file
-        // at path (created or truncated); see the header comment.
+        // at path (created or truncated); see the header comment. During a
+        // recording this switches it to the new file. Both this and
+        // StopRecording come from the monitor's thread and may run while the
+        // emulation is recording a frame: recorderLock keeps them apart.
         public void RecordFrames(string path)
         {
-            StopRecording();
-            recorder = new StreamWriter(path, false, new UTF8Encoding(false));
-            recorder.AutoFlush = true;
-            lastRecordedSha1 = null;
-            this.Log(LogLevel.Info, "recording frames to {0}", path);
+            lock(recorderLock)
+            {
+                StopRecording();
+                recorder = new StreamWriter(path, false, new UTF8Encoding(false));
+                recorder.AutoFlush = true;
+                lastRecordedSha1 = null;
+                this.Log(LogLevel.Info, "recording frames to {0}", path);
+            }
         }
 
         public void StopRecording()
         {
-            if(recorder != null)
+            lock(recorderLock)
             {
-                recorder.Flush();
-                recorder.Dispose();
-                recorder = null;
-                this.Log(LogLevel.Info, "frame recording stopped");
+                if(recorder != null)
+                {
+                    recorder.Flush();
+                    recorder.Dispose();
+                    recorder = null;
+                    this.Log(LogLevel.Info, "frame recording stopped");
+                }
             }
         }
 
@@ -456,10 +467,17 @@ namespace Antmicro.Renode.Peripherals.SPI
         // high nibble of one more byte (see FinishTransmission).
         private void RecordFrame(bool lastNibble)
         {
-            if(recorder == null)
+            lock(recorderLock)
             {
-                return;
+                if(recorder != null)
+                {
+                    WriteFrameLine(lastNibble);
+                }
             }
+        }
+
+        private void WriteFrameLine(bool lastNibble)
+        {
             var time = machine.LocalTimeSource.ElapsedVirtualTime.TotalSeconds.ToString("F6", CultureInfo.InvariantCulture);
             string sha1 = null;
             if(framebufferChanged || lastRecordedSha1 == null)
@@ -572,6 +590,7 @@ namespace Antmicro.Renode.Peripherals.SPI
         private ulong journalSequence;
         private ulong journalDropped;
         private StreamWriter recorder;
+        private readonly object recorderLock = new object();
         private string lastRecordedSha1;
         private bool framebufferChanged;
 
