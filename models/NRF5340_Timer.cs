@@ -10,14 +10,22 @@
 //       PUBLISH_COMPARE[n]                        0x1C0
 //   - up to 8 CC channels (network-core TIMER0..2 have 8 per the network
 //     SVD; application-core TIMER0..2 have 6)
-//   - TASKS_SHUTDOWN implemented as stop (task is deprecated; stops the
-//     timer without clearing the counter)
+//   - TASKS_SHUTDOWN (task and SUBSCRIBE_SHUTDOWN) powers the timer off:
+//     stopped and counter cleared. ESB triggers it after every transfer and
+//     restarts the timer expecting it to count from zero again.
 //
 // Pass `dppic:` in the platform description to attach the instance to its
 // DPPI domain hub (see models/DPPI_README.md).
 //
 //   - SHORTS (0x200): COMPARE[n]_CLEAR (bits 0-7) and COMPARE[n]_STOP (bits
-//     8-15). MPSL depends on COMPARE0_CLEAR: it starts TIMER0 from an RTC
+//     16-23; bits 8-15 and 24-31 are reserved). This is NOT the nRF52 layout
+//     (STOP at bits 8-13): MDK nrf5340_*_bitfields.h has
+//     TIMER_SHORTS_COMPARE0_STOP_Pos = 16. ESB's ack timeout and
+//     retransmissions depend on COMPARE1_STOP / COMPARE2_STOP; with the stop
+//     shortcuts lost, a master timeslot sends one packet and never retries,
+//     and the lens-to-lens link can die for good on some seeds ("sync to
+//     slave failed").
+//     MPSL depends on COMPARE0_CLEAR: it starts TIMER0 from an RTC
 //     tick, lets it run to CC[0] and has the short clear it there, which
 //     defines time zero of every radio event and timeslot. Without the short
 //     all later timestamps are CC[0] too large, the SoftDevice Controller
@@ -25,6 +33,7 @@
 //     line 3429), which stops the net core.
 //
 // Not implemented (accesses log UNIMPL): ONESHOTEN[n] (0x580), INTEN (0x300).
+// BITMODE is stored but not applied: the counter never wraps.
 //
 using System;
 
@@ -73,7 +82,7 @@ namespace Antmicro.Renode.Peripherals.Timers
             subscribeStop = new DPPISubscribeEndpoint(dppic, this, "STOP", StopTimer);
             subscribeCount = new DPPISubscribeEndpoint(dppic, this, "COUNT", CountTick);
             subscribeClear = new DPPISubscribeEndpoint(dppic, this, "CLEAR", ClearTimer);
-            subscribeShutdown = new DPPISubscribeEndpoint(dppic, this, "SHUTDOWN", StopTimer);
+            subscribeShutdown = new DPPISubscribeEndpoint(dppic, this, "SHUTDOWN", ShutdownTimer);
 
             DefineRegisters();
         }
@@ -175,8 +184,7 @@ namespace Antmicro.Renode.Peripherals.Timers
                 {
                     if(value)
                     {
-                        // deprecated task: stops the timer, counter is not cleared
-                        StopTimer();
+                        ShutdownTimer();
                     }
                 })
                 .WithReservedBits(1, 31)
@@ -232,8 +240,9 @@ namespace Antmicro.Renode.Peripherals.Timers
 
             Register.Shortcuts.Define(this)
                 .WithValueField(0, 8, out shortCompareClear, name: "COMPAREn_CLEAR")
-                .WithValueField(8, 8, out shortCompareStop, name: "COMPAREn_STOP")
-                .WithReservedBits(16, 16)
+                .WithReservedBits(8, 8)
+                .WithValueField(16, 8, out shortCompareStop, name: "COMPAREn_STOP")
+                .WithReservedBits(24, 8)
             ;
 
             Register.PublishCompare0.DefineMany(this, (uint)numberOfEvents, setup: (register, idx) =>
@@ -324,6 +333,13 @@ namespace Antmicro.Renode.Peripherals.Timers
             {
                 timer.Enabled = false;
             }
+        }
+
+        // SHUTDOWN powers the timer off: stopped and counter cleared.
+        private void ShutdownTimer()
+        {
+            StopTimer();
+            ClearTimer();
         }
 
         private void CountTick()

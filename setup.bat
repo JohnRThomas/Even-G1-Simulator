@@ -6,9 +6,9 @@ rem
 rem Needs curl, certutil and tar (all ship with Windows 10 1803 and later).
 setlocal EnableExtensions EnableDelayedExpansion
 
-set "VERSION=1.16.1"
-set "URL=https://github.com/renode/renode/releases/download/v%VERSION%/renode-%VERSION%.windows-portable-dotnet.zip"
-set "SHA256=d09b7934cfd560cd06bde8f131ef78f521f10d423d5aac6096f2a583224aeb3e"
+set "VERSION=1.17.0"
+set "URL=https://github.com/renode/renode/releases/download/v%VERSION%/renode-%VERSION%.windows-portable.zip"
+set "SHA256=18bcf145422039e8702c3e5f9864c7787561bfd5deb7a3ee6e168ecf19e2b9db"
 
 cd /d "%~dp0" || exit /b 1
 

@@ -6,9 +6,9 @@
 # Needs curl, sha256sum and tar.
 set -eu
 
-VERSION=1.16.1
-URL="https://github.com/renode/renode/releases/download/v$VERSION/renode-$VERSION.linux-portable-dotnet.tar.gz"
-SHA256=00e113cdbd0f5354cf2f64bbe3f5a070d8958409542fca66e45ac97d982938c0
+VERSION=1.17.0
+URL="https://github.com/renode/renode/releases/download/v$VERSION/renode-$VERSION.linux-portable.tar.gz"
+SHA256=4ba7c68b59e2447f188ef4b4b112fcccd2802582c460beedceb63b84e5605a5f
 
 cd "$(dirname "$0")"
 

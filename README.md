@@ -11,7 +11,7 @@ Requirements: Python 3 and [Renode](https://renode.io) 1.16 or newer.
 ./setup.sh
 ```
 
-`setup.sh` installs Renode 1.16.1 for Linux x86_64, on other systems install Renode yourself.
+`setup.sh` installs Renode 1.17.0 for Linux x86_64, on other systems install Renode yourself.
 
 On Windows x64, run `setup.bat` instead, and start the scripts with `python`, e.g.
 `python g1sim.py dfu_application.zip`.
@@ -48,6 +48,7 @@ Using raw bin files:
 | `--mac-master MAC` | MAC of the master lens (default `E9:A4:9E:29:70:D9`) |
 | `--mac-slave MAC` | MAC of the slave lens (default `F2:65:0B:5B:EB:85`) |
 | | the firmware sets the top two bits of the first byte; the last three bytes end the advertised name |
+| `--timing serial\|accurate` | how the cores share time (default `serial`, see [Timing](#timing)) |
 | `--renode PATH` | Renode executable (otherwise `$RENODE`, `.renode/`, `PATH`) |
 
 # CLI Input/Ouput
@@ -80,6 +81,7 @@ Then navigate to: http://127.0.0.1:8340/
 | `--mac-master MAC` | MAC of the master lens (default `E9:A4:9E:29:70:D9`) |
 | `--mac-slave MAC` | MAC of the slave lens (default `F2:65:0B:5B:EB:85`) |
 | | the firmware sets the top two bits of the first byte; the last three bytes end the advertised name |
+| `--timing serial\|accurate` | how the cores share time (default `accurate` here, see [Timing](#timing)) |
 | `--renode PATH` | Renode executable (otherwise `$RENODE`, `.renode/`, `PATH`) |
 
 ## Frame Recording

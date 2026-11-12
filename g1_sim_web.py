@@ -12,6 +12,11 @@ display, touch bar, state, both UART consoles, the virtual phone with a box
 for the protocol packets it is to send, sensor inputs, a monitor command box
 and the GPIO pins.
 
+Unlike g1sim.py it runs with --timing accurate unless told otherwise: the net
+cores' timers and the radio link between the lenses are exact, so what a
+person does at the page meets the firmware's real radio timing
+(g1sim.TIMING_MODES, README "Timing"). 1.6.6 needs --timing serial.
+
 The server owns one headless Renode and talks to its monitor over a local
 TCP socket; UART output is read from Renode's log. It listens on the loopback
 interface only: the page can run any Renode monitor command.
@@ -474,8 +479,9 @@ class Frames:
 
 
 class Api:
-    def __init__(self, renode, firmware, frames):
+    def __init__(self, renode, firmware, frames, timing):
         self.renode = renode
+        self.timing = timing
         # lens -> what it runs, as g1sim.prepare_firmware describes it
         self.firmware = {lens: firmware[machine] for lens, machine in LENSES.items()}
         self.frames = frames
@@ -725,7 +731,10 @@ class Api:
         return result
 
     def set_quantum(self):
-        """The shorter time quantum while a phone is on (see g1sim.QUANTUM)."""
+        """The shorter time quantum while a phone is on (see g1sim.QUANTUM).
+        The accurate timing picks its quantum itself."""
+        if self.timing == "accurate":
+            return
         rn, phones = self.renode, 0
         for lens in LENSES:
             with rn.on(lens):
@@ -860,7 +869,7 @@ class Server(ThreadingHTTPServer):
 def main():
     parser = argparse.ArgumentParser(
         description="Run prebuilt Even Realities G1 firmware in Renode with a browser front end.")
-    g1sim.add_setup_arguments(parser)
+    g1sim.add_setup_arguments(parser, timing="accurate")
     parser.add_argument("--port", type=int, default=8340, metavar="N",
                         help="HTTP port on 127.0.0.1 (default 8340)")
     parser.add_argument("--paused", action="store_true",
@@ -888,7 +897,7 @@ def main():
         with open(session, "w") as f:
             f.write("\n".join(lines) + "\n")
 
-        print("g1_sim_web: starting Renode ...", flush=True)
+        print("g1_sim_web: starting Renode (%s timing) ..." % args.timing, flush=True)
         try:
             renode.start()
         except MonitorError as e:
@@ -897,7 +906,7 @@ def main():
                 sys.stderr.write("".join(f.readlines()[-25:]))
             sys.exit("g1_sim_web: %s (end of the Renode log is above)" % e)
 
-        Handler.api = Api(renode, firmware, frames)
+        Handler.api = Api(renode, firmware, frames, args.timing)
         Handler.renode = renode
         Handler.hosts = ("127.0.0.1:%d" % args.port, "localhost:%d" % args.port)
         try:
@@ -971,9 +980,9 @@ main { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 
 .lens-col { display: grid; gap: 12px; min-width: 0; }
 .panel { background: var(--panel); border: 1px solid var(--panel-edge);
          border-radius: 6px; padding: 12px 14px; min-width: 0; }
-.display-wrap { overflow-x: auto; }
-/* No width here: fitDisplays() sets a whole-number multiple of the panel size. */
-canvas.lens-display { box-sizing: content-box; image-rendering: pixelated;
+/* Fills the panel's width, the height following the panel's 4:3; fitDisplays()
+   picks how the browser scales it. */
+canvas.lens-display { box-sizing: border-box; width: 100%; height: auto; image-rendering: pixelated;
                       background: #000; border: 1px solid var(--panel-edge); display: block; }
 table.kv { border-collapse: collapse; width: 100%; }
 table.kv th { text-align: left; color: var(--dim); font-weight: normal; width: 1%;
@@ -1140,7 +1149,7 @@ function lensColumn(lens) {
 
   <section class="panel">
     <h3>Display <span class="dim mono" id="frames-${lens}">0 window writes</span></h3>
-    <div class="display-wrap"><canvas class="lens-display" id="display-${lens}" width="640" height="480"></canvas></div>
+    <canvas class="lens-display" id="display-${lens}" width="640" height="480"></canvas>
     <div class="row" style="margin:10px 0 0">
       ${master ? `<button class="btn-hw" id="gesture-master" title="Moves the IMU model. Head-up: from a table, the 'don' motion (picked up, put on, head tilted up); when worn, the tilt alone. The firmware opens the dashboard on both lenses on the head-up. Head-down tilts the head back to level.">head-up</button>` : ""}
       <button class="btn-hw" id="touch-${lens}" title="Touches the touch bar while held: click for a tap, hold for a long press.">touch bar</button>
@@ -1276,20 +1285,20 @@ function lensDisplay(lens) {
   };
 }
 
-// Each panel pixel is drawn as the same n x n block of screen pixels (n a whole
-// number, as large as fits), so the browser never resamples the image. A lens
-// that does not fit at n = 1 scrolls sideways instead of shrinking.
+// The canvas is as wide as its panel, so the whole 640 columns are always in
+// view. Scaled up, each panel pixel stays a sharp block of screen pixels; scaled
+// down (a narrow window), the image is smoothed so that one-pixel lines grow
+// faint instead of dropping out.
 function fitDisplays() {
   const dpr = window.devicePixelRatio || 1;
   for (const canvas of document.querySelectorAll("canvas.lens-display")) {
-    const room = canvas.parentElement.clientWidth - 2;      // less the border
-    if (room <= 0) continue;                                // not laid out yet
-    const n = Math.max(1, Math.floor(room * dpr / canvas.width));
-    canvas.style.width = (canvas.width * n / dpr) + "px";
+    const across = canvas.clientWidth * dpr;                // device pixels, less the border
+    if (across <= 0) continue;                              // not laid out yet
+    canvas.style.imageRendering = across >= canvas.width ? "pixelated" : "auto";
   }
 }
 for (const canvas of document.querySelectorAll("canvas.lens-display"))
-  new ResizeObserver(fitDisplays).observe(canvas.parentElement);
+  new ResizeObserver(fitDisplays).observe(canvas);
 window.addEventListener("resize", fitDisplays);     // browser zoom changes the ratio
 
 const displayPollers = Object.fromEntries(LENSES.map(lens => [lens, lensDisplay(lens)]));

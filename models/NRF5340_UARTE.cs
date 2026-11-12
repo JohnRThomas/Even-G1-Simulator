@@ -31,6 +31,7 @@ using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure.Registers;
 using Antmicro.Renode.Logging;
 using Antmicro.Renode.Peripherals.Bus;
+using Antmicro.Renode.Peripherals.CPU;
 using Antmicro.Renode.Peripherals.Miscellaneous;
 using Antmicro.Renode.Peripherals.Timers;
 using Antmicro.Renode.Time;
@@ -57,10 +58,48 @@ namespace Antmicro.Renode.Peripherals.UART
         // or completes at once.
         public bool TxTiming { get; set; } = true;
 
+        // Whether a core polling for the end of its transmission sees it end
+        // on its own clock (PollLocalCompletion). For a core that is not the one
+        // its machine's clock follows (the app core, see G1_Timing.cs): such a
+        // core runs ahead of the clock by up to a time quantum, and Zephyr's
+        // poll_out, which spins on ENDTX for 100 us and then sleeps 1 ms, would
+        // otherwise miss the end of almost every character once the quantum is
+        // longer than that.
+        public bool TxLocalPoll { get; set; }
+        public ulong LocalCompletions { get; private set; }
+
+        // Called before a read of a transmit event: if the reading core is the
+        // one that started the transmission and its own clock has passed the
+        // transmission's end, the transmission ends now.
+        private void PollLocalCompletion()
+        {
+            if(txInFlight == 0 || !txDueLocal.HasValue || txCpu == null)
+            {
+                return;
+            }
+            if(!sysbus.TryGetCurrentCPU(out var cpu) || cpu != txCpu)
+            {
+                return;
+            }
+            txCpu.SyncTime();
+            if(txCpu.TimeHandle.TotalElapsedTime >= txDueLocal.Value)
+            {
+                LocalCompletions++;
+                FinishTx();
+            }
+        }
+
+        private TimeInterval? txDueLocal;
+        private BaseCPU txCpu;
+
         public uint ReadDoubleWord(long offset)
         {
             lock(interruptManager)
             {
+                if(TxLocalPoll && (offset == (long)Registers.EndTx || offset == (long)Registers.TxStopped || offset == (long)Registers.TxDReady))
+                {
+                    PollLocalCompletion();
+                }
                 return registers.Read(offset);
             }
         }
@@ -410,6 +449,15 @@ namespace Antmicro.Renode.Peripherals.UART
                     return;
                 }
                 var microseconds = Math.Max(1UL, (ulong)count * bitsPerFrame * 1000000UL / baud);
+                txDueLocal = null;
+                if(TxLocalPoll && sysbus.TryGetCurrentCPU(out var cpu) && cpu is BaseCPU baseCpu)
+                {
+                    // When this transmission is done on the writing core's own
+                    // clock (see PollLocalCompletion).
+                    baseCpu.SyncTime();
+                    txDueLocal = baseCpu.TimeHandle.TotalElapsedTime + TimeInterval.FromMicroseconds(microseconds);
+                    txCpu = baseCpu;
+                }
                 txTimer.Enabled = false;
                 txTimer.Limit = microseconds;
                 txTimer.Value = 0;
@@ -432,6 +480,7 @@ namespace Antmicro.Renode.Peripherals.UART
                 }
                 txAmount.Value = (ulong)txInFlight;
                 txInFlight = 0;
+                txDueLocal = null;
                 RaiseTxDone();
                 interruptManager.SetInterrupt(Interrupts.TransmitReady);
                 EventTriggered?.Invoke((uint)Registers.TxDReady);

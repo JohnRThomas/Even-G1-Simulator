@@ -114,10 +114,32 @@ namespace Antmicro.Renode.Peripherals.Wireless
             bcTimer = new DelayedAction(machine, this, "radioBitCounter");
             edTimer = new DelayedAction(machine, this, "radioEnergyDetect");
             ccaTimer = new DelayedAction(machine, this, "radioCca");
+            deliveryTimer = new LimitTimer(machine.ClockSource, DeliveryTimerFrequency, this, "radioPeerDelivery",
+                limit: 1, direction: Direction.Ascending, enabled: false,
+                workMode: WorkMode.OneShot, eventEnabled: true);
+            deliveryTimer.LimitReached += DeliverDue;
 
             DefineRegisters();
             Reset();
         }
+
+        // Whether the radio is enabled (ramping up, sending or listening).
+        // Read by the accurate timing's quantum choice (G1_Timing.cs).
+        public bool Busy => radioState != State.Disabled;
+
+        // Direct delivery between the lenses (see DeliverToPeers). When set on
+        // both radios, a frame goes from one lens's radio straight to the
+        // other's, stamped with the sender's virtual time, and arrives on the
+        // receiver's own clock at that time; Renode's wireless medium, which
+        // hands a frame over only at the receiving machine's next sync point
+        // (up to two time quanta late), is then ignored.
+        public bool DirectPeerDelivery { get; set; }
+
+        // Frames delivered directly, and how many of them came in late (the
+        // receiving lens had already run past the send time) and by how much.
+        public ulong PeerFramesOnTime { get; private set; }
+        public ulong PeerFramesLate { get; private set; }
+        public double PeerMaxLatenessUs { get; private set; }
 
         public override void Reset()
         {
@@ -156,6 +178,11 @@ namespace Antmicro.Renode.Peripherals.Wireless
             ccaTimer.Cancel();
             pendingFrame = null;
             pendingSender = null;
+            lock(peerQueue)
+            {
+                peerQueue.Clear();
+                deliveryTimer.Enabled = false;
+            }
             IRQ.Unset();
         }
 
@@ -282,10 +309,117 @@ namespace Antmicro.Renode.Peripherals.Wireless
             {
                 frame[i] = Convert.ToByte(clean.Substring(2 * i, 2), 16);
             }
-            ReceiveFrame(frame, null);
+            ReceiveFrameNow(frame, null);
         }
 
         public void ReceiveFrame(byte[] frame, IRadio sender)
+        {
+            if(DirectPeerDelivery && sender is NRF5340_RADIO peer && peer.DirectPeerDelivery)
+            {
+                return;                     // delivered directly, on time (DeliverToPeers)
+            }
+            ReceiveFrameNow(frame, sender);
+        }
+
+        // A frame from another lens's radio, sent at the sender's virtual time
+        // `sent` on `channel`. Called on the sender's thread while this lens
+        // is not running (the time sources run the machines one after the
+        // other). If this lens is behind the sender, the frame is queued on
+        // this lens's clock and arrives exactly at `sent`; if it is ahead, the
+        // frame arrives now, as late as this lens is ahead.
+        private void EnqueuePeerFrame(byte[] frame, NRF5340_RADIO sender, int channel, TimeInterval sent)
+        {
+            var now = machine.LocalTimeSource.ElapsedVirtualTime;
+            lock(peerQueue)
+            {
+                if(sent > now)
+                {
+                    PeerFramesOnTime++;
+                }
+                else
+                {
+                    PeerFramesLate++;
+                    PeerMaxLatenessUs = Math.Max(PeerMaxLatenessUs, (now - sent).TotalMicroseconds);
+                    sent = now;
+                }
+                peerQueue.Add(new PeerFrame { Due = sent, Frame = frame, Sender = sender, Channel = channel, Seq = peerSeq++ });
+                peerQueue.Sort((a, b) => a.Due != b.Due ? a.Due.Ticks.CompareTo(b.Due.Ticks) : a.Seq.CompareTo(b.Seq));
+                ArmDelivery(now);
+            }
+        }
+
+        private void ArmDelivery(TimeInterval now)
+        {
+            deliveryTimer.Enabled = false;
+            if(peerQueue.Count == 0)
+            {
+                return;
+            }
+            var due = peerQueue[0].Due;
+            var ticks = due > now ? (ulong)Math.Round((due - now).TotalMicroseconds * DeliveryTicksPerMicrosecond) : 0;
+            deliveryTimer.Limit = Math.Max(1UL, ticks);
+            deliveryTimer.Value = 0;
+            deliveryTimer.Enabled = true;
+        }
+
+        private void DeliverDue()
+        {
+            var due = new List<PeerFrame>();
+            var now = machine.LocalTimeSource.ElapsedVirtualTime;
+            lock(peerQueue)
+            {
+                // The timer fires at the earliest due time; anything due by now
+                // (rounding to the timer's tick included) goes.
+                var slack = TimeInterval.FromMicroseconds(1);
+                while(peerQueue.Count > 0 && peerQueue[0].Due <= now + slack)
+                {
+                    due.Add(peerQueue[0]);
+                    peerQueue.RemoveAt(0);
+                }
+                if(due.Count == 0 && peerQueue.Count > 0)
+                {
+                    due.Add(peerQueue[0]);
+                    peerQueue.RemoveAt(0);
+                }
+                ArmDelivery(now);
+            }
+            foreach(var f in due)
+            {
+                if(f.Channel != Channel)
+                {
+                    this.Log(LogLevel.Noisy, "Dropping peer frame from channel {0} (listening on {1})", f.Channel, Channel);
+                    continue;
+                }
+                ReceiveFrameNow(f.Frame, null);
+            }
+        }
+
+        // Called where the radio starts putting a frame on the air.
+        private void DeliverToPeers(byte[] wire)
+        {
+            if(!DirectPeerDelivery)
+            {
+                return;
+            }
+            var sent = machine.LocalTimeSource.ElapsedVirtualTime;
+            var channel = Channel;
+            foreach(var other in EmulationManager.Instance.CurrentEmulation.Machines)
+            {
+                if(other == machine)
+                {
+                    continue;
+                }
+                foreach(var peer in other.GetPeripheralsOfType<NRF5340_RADIO>())
+                {
+                    if(peer.DirectPeerDelivery)
+                    {
+                        peer.EnqueuePeerFrame((byte[])wire.Clone(), this, channel, sent);
+                    }
+                }
+            }
+        }
+
+        private void ReceiveFrameNow(byte[] frame, IRadio sender)
         {
             if(sender != null && sender.Channel != Channel)
             {
@@ -1178,6 +1312,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
             this.Log(LogLevel.Noisy, "TX frame on channel {0} ({1} bytes, crc=0x{2:X})", Channel, wire.Length, crc);
             TransmittedFrames++;
             LastTransmittedFrame = BitConverter.ToString(wire).Replace("-", "");
+            DeliverToPeers(wire);
             FrameSent?.Invoke(this, wire);
 
             var byteTime = ByteTimeUs();
@@ -1524,6 +1659,20 @@ namespace Antmicro.Renode.Peripherals.Wireless
         private readonly DelayedAction bcTimer;
         private readonly DelayedAction edTimer;
         private readonly DelayedAction ccaTimer;
+        private readonly LimitTimer deliveryTimer;
+        private readonly List<PeerFrame> peerQueue = new List<PeerFrame>();
+        private ulong peerSeq;
+        private const long DeliveryTimerFrequency = 16000000;
+        private const double DeliveryTicksPerMicrosecond = 16;
+
+        private struct PeerFrame
+        {
+            public TimeInterval Due;
+            public byte[] Frame;
+            public NRF5340_RADIO Sender;
+            public int Channel;
+            public ulong Seq;
+        }
 
         // Timing constants — see the "Timing model" header comment for sources.
         private const double TxRampUpUs = 129;

@@ -36,6 +36,11 @@ UART Service, pairing); --phone-g2 one speaking the G2 app's protocol (the
 Even service 00002760-..., 0xAA frames with protobuf payloads, application
 level auth). One or the other: a lens takes one phone at a time.
 
+--timing accurate keeps the net cores' timers and the radio link between the
+lenses on time and picks the time quantum as the emulation goes, a little
+slower than the default (see TIMING_MODES below and README, "Timing").
+g1_sim_web.py uses it by default.
+
 Needs Python 3 (standard library only) and Renode. Renode is taken from
 --renode, $RENODE, the copy that setup.sh puts into this folder, or PATH, in
 that order.
@@ -80,21 +85,38 @@ EXTSTORE = {MASTER: os.path.join(HERE, "data", "g1_extstore_left.bin"),
 LOCAL_RENODE = os.path.join(HERE, ".renode", "renode.exe" if os.name == "nt" else "renode")
 
 # The emulation's time quantum: how far a core runs before the cores are
-# brought back in step. Within a quantum a core's timers can run late by up to
-# that long while another core is busy. The SoftDevice Controller checks its
-# radio timing against a timer and stops (the lens then reboots) if it finds
-# itself late by more than some tens of microseconds, which a connection with
-# a phone, with its 150 us turnarounds, would run into at Renode's default of
-# 100 us. A lens that only advertises does not, so the shorter quantum, which
-# costs about a third of the speed, is only used while a phone is switched on.
+# brought back in step. The four cores run one after the other within a
+# quantum and a lens's clock only advances as far as the slowest core has run,
+# so a core's timers can fire up to a quantum late. The SoftDevice Controller
+# checks its radio timing against a timer and stops (the lens then reboots) if
+# it finds itself late by more than some tens of microseconds, which a
+# connection with a phone, with its 150 us turnarounds, runs into at Renode's
+# default of 100 us; the ESB acknowledgement between the lenses has a limit of
+# the same order. A lens that only advertises needs neither, so the shorter
+# quantum is only used while a phone is switched on. On Renode 1.17 it costs
+# little (README, "Simulated Phone").
 QUANTUM = "0.0001"
 PHONE_QUANTUM = "0.00005"
 
+# --timing: "serial" is the above. "accurate" (models/G1_Timing.cs) gives each
+# lens a time source of its own whose clock follows the net core, so the
+# SoftDevice Controller, MPSL and ESB see their timers on time; hands radio
+# frames between the lenses over on the receiver's clock at the sender's time;
+# lets the app core see its polled UART transmission end on its own clock; and
+# picks the quantum at every sync point. ACCURATE_QUANTUM_US = (small, big,
+# hold): small while anything happens on either lens (a core ran, a radio is
+# on, an event came due) and for `hold` after, otherwise up to the next
+# scheduled event, at most big. On Renode 1.17 it costs about 0.75 host
+# seconds per emulated second against about 0.5 for "serial". 1.6.6 boots
+# into a watchdog restart loop under it (README, "Timing").
+TIMING_MODES = ("serial", "accurate")
+ACCURATE_QUANTUM_US = (50, 1000, 200)
+
 # The seed of Renode's pseudo-random number generator, which the net core's
 # RNG peripheral reads. Renode otherwise picks a new seed in every process;
-# the Bluetooth controller draws on the RNG, so the radio schedule, and with
-# it whether the lenses' ESB link survives the phone connecting, differed
-# between two runs of the same command. With a fixed seed the same firmware
+# the Bluetooth controller draws on the RNG, so the radio schedule (and with
+# it the timing of the lenses' ESB traffic) differed between two runs of the
+# same command. With a fixed seed the same firmware
 # and command give the same UART output and frames every time, whatever the
 # host load; --execute 'emulation SetSeed N' picks another.
 PRNG_SEED = 1
@@ -111,6 +133,15 @@ NET_RAM = (0x21000000, 0x21010000)
 
 def die(message):
     sys.exit("g1sim: " + message)
+
+
+NOTES = None                     # session_lines(notes=...): where note() writes
+
+
+def note(text):
+    """A line about what the simulator starts from: printed, or handed to the
+    program that drives the simulator (session_lines)."""
+    (NOTES or print)(text)
 
 
 def read_images(paths):
@@ -208,7 +239,7 @@ def prepare_firmware(paths, workdir):
             name, header, body = firmware[core]
             lens[core] = "%s (%d bytes, sha256 %s)" % (
                 name, len(header) + len(body), hashlib.sha256(header + body).hexdigest()[:16])
-            print("g1sim: %s%s core: %s" % (who, core, lens[core]))
+            note("g1sim: %s%s core: %s" % (who, core, lens[core]))
         lenses[machine] = lens
     lenses.setdefault(SLAVE, lenses[MASTER])
     return lenses
@@ -241,9 +272,9 @@ def extstore(machine):
         except OSError:
             die("%s, the %s lens's flash, is in use by another running simulator"
                 % (path, who))
-        print("g1sim: %s lens flash: %s, kept from an earlier run" % (who, path))
+        note("g1sim: %s lens flash: %s, kept from an earlier run" % (who, path))
     else:
-        print("g1sim: %s lens flash: %s, new" % (who, path))
+        note("g1sim: %s lens flash: %s, new" % (who, path))
     return path
 
 
@@ -281,12 +312,19 @@ def setup_lines(firmware, args):
     if args.mac_master == args.mac_slave:
         die("the two lenses need different MACs (--mac-master, --mac-slave)")
     phone = phone_peripheral(args)
+    accurate = getattr(args, "timing", "serial") == "accurate"
     lines = ["i " + monitor_path(RESC), "emulation SetSeed %d" % PRNG_SEED]
+    if accurate:
+        lines += ["i " + monitor_path(os.path.join(HERE, "models", "G1_Timing.cs")),
+                  "i " + monitor_path(os.path.join(HERE, "g1_timing.py"))]
     for machine, address in ((MASTER, args.mac_master), (SLAVE, args.mac_slave)):
         lens = firmware[machine]
+        if accurate:
+            lines += ['g1_machine_own_time "%s"' % machine, 'mach set "%s"' % machine]
+        else:
+            lines += ['mach create "%s"' % machine]
         # Set after "mach create", so that they are the lens's own.
-        lines += ['mach create "%s"' % machine,
-                  "$app_bin=" + monitor_path(lens["app_bin"]),
+        lines += ["$app_bin=" + monitor_path(lens["app_bin"]),
                   "$net_bin=" + monitor_path(lens["net_bin"]),
                   "$extstore=" + monitor_path(extstore(machine)),
                   "$slave=%s" % ("true" if machine == SLAVE else "false"),
@@ -294,13 +332,23 @@ def setup_lines(firmware, args):
                   "$deviceaddr1=0x%08X" % (0xFFFF0000 | address >> 32),
                   "i " + monitor_path(LENS_RESC)] + ANALYZERS
     lines.append('mach set "%s"' % MASTER)
+    if accurate:
+        # One core at a time across both lenses: a radio frame is handed to
+        # the other lens while that lens is not running.
+        lines.append("emulation SetGlobalSerialExecution true")
+        for machine in (MASTER, SLAVE):
+            lines.append('g1_keep_last "%s" "cpunet"' % machine)
+        lines += for_lens("sysbus.uart0 TxLocalPoll true") + for_lens("slave: sysbus.uart0 TxLocalPoll true")
+        lines += for_lens("sysbus.radio DirectPeerDelivery true") + for_lens("slave: sysbus.radio DirectPeerDelivery true")
+        lines.append("g1_adaptive_quantum %d %d %d" % ACCURATE_QUANTUM_US)
     if phone == PHONE_G2:
         # The app talks to the right lens and only authenticates the left one;
         # the firmware names the master lens _R_ and the slave _L_.
         lines += for_lens('slave: %s Side "left"' % PHONE_G2)
     if phone:                            # as the phone app: a link to each lens
-        lines += ['emulation SetGlobalQuantum "%s"' % PHONE_QUANTUM,
-                  "%s Enabled true" % phone]
+        if not accurate:                 # which sets the quantum itself
+            lines.append('emulation SetGlobalQuantum "%s"' % PHONE_QUANTUM)
+        lines.append("%s Enabled true" % phone)
         lines += for_lens("slave: %s Enabled true" % phone)
     for command in args.execute:
         lines += for_lens(command)
@@ -316,6 +364,34 @@ def frame_recording(directory, command):
         if command == "RecordFrames":
             line += " " + monitor_path(os.path.join(directory, LENS_NAMES[machine] + ".frames"))
         lines += for_lens(("slave: " if machine == SLAVE else "") + line)
+    return lines
+
+
+def session_lines(firmware, workdir, execute=(), phone_quantum=False, frames=None, notes=None):
+    """For a program that drives the simulator itself over Renode's monitor
+    (the regression tests, tests/reg/engine/driver.py): the monitor commands
+    that create both lenses with the firmware (the files named on a command
+    line: an update zip, or the .bin files), with every option of the command
+    line at its default and the virtual phones off, then run the --execute
+    style commands, record the panel contents into the directory `frames`,
+    and let virtual time run as fast as it can. `phone_quantum`: set the
+    time quantum a virtual phone needs, as --phone does, for a session that
+    switches one on later. The emulation is left paused at 0 s: the caller
+    advances it with "emulation RunFor". `notes`: a function that takes the
+    lines about the firmware and the flash files instead of their being
+    printed."""
+    global NOTES
+    NOTES = notes
+    parser = argparse.ArgumentParser()
+    add_setup_arguments(parser)
+    args = parser.parse_args(["--"] + list(firmware))
+    args.execute = list(execute)
+    lines = setup_lines(prepare_firmware(args.firmware, workdir), args)
+    if phone_quantum:
+        lines.append('emulation SetGlobalQuantum "%s"' % PHONE_QUANTUM)
+    if frames:
+        lines += frame_recording(frames, "RecordFrames")
+    lines.append("emulation SetAdvanceImmediately true")
     return lines
 
 
@@ -406,8 +482,9 @@ def mac_address(text):
         raise argparse.ArgumentTypeError("expected a MAC like E9:A4:9E:29:70:D9, got %r" % text)
 
 
-def add_setup_arguments(parser):
-    """The firmware and the options every front end shares (see setup_lines)."""
+def add_setup_arguments(parser, timing="serial"):
+    """The firmware and the options every front end shares (see setup_lines);
+    `timing` is the front end's default --timing."""
     parser.add_argument("firmware", nargs="+", metavar="FIRMWARE",
                         help="an update zip, or the app-core and net-core .bin files; "
                              "both lenses run it. A second firmware, given the same "
@@ -432,6 +509,12 @@ def add_setup_arguments(parser):
                                  "the top two bits of its first byte, and ends the "
                                  "name it advertises under with the last three bytes"
                                  % (LENS_NAMES[machine], DEFAULT_MAC[machine]))
+    parser.add_argument("--timing", choices=TIMING_MODES, default=timing,
+                        help="how the emulated cores share time (default %s): 'serial' "
+                             "runs all four cores on one clock at a fixed time quantum, "
+                             "so a core's interrupts can come up to a quantum late; "
+                             "'accurate' keeps the net cores and the radio link between "
+                             "the lenses exact, a little slower (README, \"Timing\")" % timing)
     parser.add_argument("--renode", metavar="PATH", help="Renode executable to use")
 
 
@@ -463,8 +546,13 @@ def main():
         firmware = prepare_firmware(args.firmware, workdir)
         session = write_session(firmware, workdir, args)
         sys.stdout.flush()
+        # A timed run's session ends with "quit", so Renode reads nothing from
+        # stdin; it gets an open pipe all the same. Renode's console reader
+        # does not wait on a stdin at end of file but polls it constantly. This
+        # keeps a core super busy and slows down the simulator.
         process = subprocess.Popen(
-            [renode, "--disable-xwt", "--console", "--plain", session])
+            [renode, "--disable-xwt", "--console", "--plain", session],
+            stdin=subprocess.PIPE if args.seconds is not None else None)
         while True:
             try:
                 return process.wait()
