@@ -463,8 +463,13 @@ def main():
         firmware = prepare_firmware(args.firmware, workdir)
         session = write_session(firmware, workdir, args)
         sys.stdout.flush()
+        # A timed run's session ends with "quit", so Renode reads nothing from
+        # stdin; it gets an open pipe all the same. Renode's console reader
+        # does not wait on a stdin at end of file but polls it constantly. This
+        # keeps a core super busy and slows down the simulator.
         process = subprocess.Popen(
-            [renode, "--disable-xwt", "--console", "--plain", session])
+            [renode, "--disable-xwt", "--console", "--plain", session],
+            stdin=subprocess.PIPE if args.seconds is not None else None)
         while True:
             try:
                 return process.wait()
