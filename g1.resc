@@ -33,38 +33,12 @@
 using sysbus
 path add $ORIGIN
 
-# Custom nRF5340 + board peripheral models. Order matters: NRF5340_DPPIC
-# defines the DPPI hub types that the EGU/Timer/RTC/IPC/RADIO models use.
-i @models/NRF5340_TrapStub.cs
-i @models/NRF5340_UARTE.cs
-i @models/NRF5340_CC3xx_RNG.cs
-i @models/NRF5340_ClockPowerReset.cs
-i @models/NRF5340_DPPIC.cs
-i @models/NRF5340_IPC.cs
-i @models/NRF5340_RADIO.cs
-i @models/BLE_VirtualCentral.cs
-i @models/BLE_VirtualCentralG2.cs
-i @models/NRF5340_AAR.cs
-i @models/NRF5340_CCM.cs
-i @models/NRF5340_TEMP.cs
-i @models/NRF5340_VREQCTRL.cs
-i @models/NRF5340_EGU.cs
-i @models/NRF5340_Timer.cs
-i @models/NRF5340_RTC.cs
-i @models/NRF5340_SPIM.cs
-i @models/JBD_Display.cs
-i @models/Macronix_MX25U.cs
-i @models/NRF5340_NVMC.cs
-i @models/NRF5340_QSPI.cs
-i @models/NRF5340_SAADC.cs
-i @models/NRF5340_PDM.cs
-i @models/GPIO_Pin_Driver.cs
-i @models/NRF5340_TWIM.cs
-i @models/ST_LSM6DSO.cs
-i @models/TI_OPT3001.cs
-i @models/Nordic_NPM1300.cs
-i @models/ST_ST25DV.cs
-i @models/G1_TouchController.cs
+# Custom nRF5340 + board peripheral models, all in one "i": Renode then
+# compiles them together, in about 1.5 s. One "i" per file is a compiler run
+# per file, 11 s for the 30 of them. Compiled together they also see each
+# other's types (NRF5340_DPPIC's DPPI hub, which the EGU/Timer/RTC/IPC/RADIO
+# models use) whatever their order. Needs Renode 1.16.1 or newer.
+i @models/NRF5340_TrapStub.cs @models/NRF5340_UARTE.cs @models/NRF5340_CC3xx_RNG.cs @models/NRF5340_ClockPowerReset.cs @models/NRF5340_DPPIC.cs @models/NRF5340_IPC.cs @models/NRF5340_RADIO.cs @models/BLE_VirtualCentral.cs @models/BLE_VirtualCentralG2.cs @models/NRF5340_AAR.cs @models/NRF5340_CCM.cs @models/NRF5340_TEMP.cs @models/NRF5340_VREQCTRL.cs @models/NRF5340_EGU.cs @models/NRF5340_Timer.cs @models/NRF5340_RTC.cs @models/NRF5340_SPIM.cs @models/JBD_Display.cs @models/Macronix_MX25U.cs @models/NRF5340_NVMC.cs @models/NRF5340_QSPI.cs @models/NRF5340_SAADC.cs @models/NRF5340_PDM.cs @models/GPIO_Pin_Driver.cs @models/NRF5340_TWIM.cs @models/ST_LSM6DSO.cs @models/TI_OPT3001.cs @models/Nordic_NPM1300.cs @models/ST_ST25DV.cs @models/G1_TouchController.cs
 
 # The radio medium the lenses of a pair (and nothing else) share.
 emulation CreateBLEMedium "wireless"

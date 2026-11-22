@@ -1,6 +1,6 @@
 @echo off
 rem Download Renode into .renode\ next to this script, where g1sim.py looks for
-rem it. Windows x64 only; elsewhere install Renode 1.16+ yourself and put it on
+rem it. Windows x64 only; elsewhere install Renode 1.16.1+ yourself and put it on
 rem PATH or in %RENODE%. Run again to reinstall.
 rem
 rem Needs curl, certutil and tar (all ship with Windows 10 1803 and later).

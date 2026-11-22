@@ -36,11 +36,6 @@ UART Service, pairing); --phone-g2 one speaking the G2 app's protocol (the
 Even service 00002760-..., 0xAA frames with protobuf payloads, application
 level auth). One or the other: a lens takes one phone at a time.
 
---timing accurate keeps the net cores' timers and the radio link between the
-lenses on time and picks the time quantum as the emulation goes, a little
-slower than the default (see TIMING_MODES below and README, "Timing").
-g1_sim_web.py uses it by default.
-
 Needs Python 3 (standard library only) and Renode. Renode is taken from
 --renode, $RENODE, the copy that setup.sh puts into this folder, or PATH, in
 that order.
@@ -97,20 +92,6 @@ LOCAL_RENODE = os.path.join(HERE, ".renode", "renode.exe" if os.name == "nt" els
 # little (README, "Simulated Phone").
 QUANTUM = "0.0001"
 PHONE_QUANTUM = "0.00005"
-
-# --timing: "serial" is the above. "accurate" (models/G1_Timing.cs) gives each
-# lens a time source of its own whose clock follows the net core, so the
-# SoftDevice Controller, MPSL and ESB see their timers on time; hands radio
-# frames between the lenses over on the receiver's clock at the sender's time;
-# lets the app core see its polled UART transmission end on its own clock; and
-# picks the quantum at every sync point. ACCURATE_QUANTUM_US = (small, big,
-# hold): small while anything happens on either lens (a core ran, a radio is
-# on, an event came due) and for `hold` after, otherwise up to the next
-# scheduled event, at most big. On Renode 1.17 it costs about 0.75 host
-# seconds per emulated second against about 0.5 for "serial". 1.6.6 boots
-# into a watchdog restart loop under it (README, "Timing").
-TIMING_MODES = ("serial", "accurate")
-ACCURATE_QUANTUM_US = (50, 1000, 200)
 
 # The seed of Renode's pseudo-random number generator, which the net core's
 # RNG peripheral reads. Renode otherwise picks a new seed in every process;
@@ -253,7 +234,7 @@ def find_renode(explicit):
             if not os.path.isfile(candidate):
                 die("Renode not found at " + candidate)
             return candidate
-    die("Renode not found. Run ./setup.sh (setup.bat on Windows), or install Renode 1.16+ and put it "
+    die("Renode not found. Run ./setup.sh (setup.bat on Windows), or install Renode 1.16.1+ and put it "
         "on PATH or in $RENODE.")
 
 
@@ -312,19 +293,12 @@ def setup_lines(firmware, args):
     if args.mac_master == args.mac_slave:
         die("the two lenses need different MACs (--mac-master, --mac-slave)")
     phone = phone_peripheral(args)
-    accurate = getattr(args, "timing", "serial") == "accurate"
     lines = ["i " + monitor_path(RESC), "emulation SetSeed %d" % PRNG_SEED]
-    if accurate:
-        lines += ["i " + monitor_path(os.path.join(HERE, "models", "G1_Timing.cs")),
-                  "i " + monitor_path(os.path.join(HERE, "g1_timing.py"))]
     for machine, address in ((MASTER, args.mac_master), (SLAVE, args.mac_slave)):
         lens = firmware[machine]
-        if accurate:
-            lines += ['g1_machine_own_time "%s"' % machine, 'mach set "%s"' % machine]
-        else:
-            lines += ['mach create "%s"' % machine]
         # Set after "mach create", so that they are the lens's own.
-        lines += ["$app_bin=" + monitor_path(lens["app_bin"]),
+        lines += ['mach create "%s"' % machine,
+                  "$app_bin=" + monitor_path(lens["app_bin"]),
                   "$net_bin=" + monitor_path(lens["net_bin"]),
                   "$extstore=" + monitor_path(extstore(machine)),
                   "$slave=%s" % ("true" if machine == SLAVE else "false"),
@@ -332,23 +306,13 @@ def setup_lines(firmware, args):
                   "$deviceaddr1=0x%08X" % (0xFFFF0000 | address >> 32),
                   "i " + monitor_path(LENS_RESC)] + ANALYZERS
     lines.append('mach set "%s"' % MASTER)
-    if accurate:
-        # One core at a time across both lenses: a radio frame is handed to
-        # the other lens while that lens is not running.
-        lines.append("emulation SetGlobalSerialExecution true")
-        for machine in (MASTER, SLAVE):
-            lines.append('g1_keep_last "%s" "cpunet"' % machine)
-        lines += for_lens("sysbus.uart0 TxLocalPoll true") + for_lens("slave: sysbus.uart0 TxLocalPoll true")
-        lines += for_lens("sysbus.radio DirectPeerDelivery true") + for_lens("slave: sysbus.radio DirectPeerDelivery true")
-        lines.append("g1_adaptive_quantum %d %d %d" % ACCURATE_QUANTUM_US)
     if phone == PHONE_G2:
         # The app talks to the right lens and only authenticates the left one;
         # the firmware names the master lens _R_ and the slave _L_.
         lines += for_lens('slave: %s Side "left"' % PHONE_G2)
     if phone:                            # as the phone app: a link to each lens
-        if not accurate:                 # which sets the quantum itself
-            lines.append('emulation SetGlobalQuantum "%s"' % PHONE_QUANTUM)
-        lines.append("%s Enabled true" % phone)
+        lines += ['emulation SetGlobalQuantum "%s"' % PHONE_QUANTUM,
+                  "%s Enabled true" % phone]
         lines += for_lens("slave: %s Enabled true" % phone)
     for command in args.execute:
         lines += for_lens(command)
@@ -482,9 +446,8 @@ def mac_address(text):
         raise argparse.ArgumentTypeError("expected a MAC like E9:A4:9E:29:70:D9, got %r" % text)
 
 
-def add_setup_arguments(parser, timing="serial"):
-    """The firmware and the options every front end shares (see setup_lines);
-    `timing` is the front end's default --timing."""
+def add_setup_arguments(parser):
+    """The firmware and the options every front end shares (see setup_lines)."""
     parser.add_argument("firmware", nargs="+", metavar="FIRMWARE",
                         help="an update zip, or the app-core and net-core .bin files; "
                              "both lenses run it. A second firmware, given the same "
@@ -509,12 +472,6 @@ def add_setup_arguments(parser, timing="serial"):
                                  "the top two bits of its first byte, and ends the "
                                  "name it advertises under with the last three bytes"
                                  % (LENS_NAMES[machine], DEFAULT_MAC[machine]))
-    parser.add_argument("--timing", choices=TIMING_MODES, default=timing,
-                        help="how the emulated cores share time (default %s): 'serial' "
-                             "runs all four cores on one clock at a fixed time quantum, "
-                             "so a core's interrupts can come up to a quantum late; "
-                             "'accurate' keeps the net cores and the radio link between "
-                             "the lenses exact, a little slower (README, \"Timing\")" % timing)
     parser.add_argument("--renode", metavar="PATH", help="Renode executable to use")
 
 

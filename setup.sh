@@ -1,6 +1,6 @@
 #!/bin/sh
 # Download Renode into .renode/ next to this script, where g1sim.py looks for
-# it. Linux x86_64 only; elsewhere install Renode 1.16+ yourself and put it on
+# it. Linux x86_64 only; elsewhere install Renode 1.16.1+ yourself and put it on
 # PATH or in $RENODE. Run again to reinstall.
 #
 # Needs curl, sha256sum and tar.

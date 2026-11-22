@@ -5,7 +5,7 @@ nRF5340s with the G1's board peripherals, one the master lens and one the slave.
 
 ## Setup
 
-Requirements: Python 3 and [Renode](https://renode.io) 1.16 or newer.
+Requirements: Python 3 and [Renode](https://renode.io) 1.16.1 or newer.
 
 ```sh
 ./setup.sh
@@ -48,7 +48,6 @@ Using raw bin files:
 | `--mac-master MAC` | MAC of the master lens (default `E9:A4:9E:29:70:D9`) |
 | `--mac-slave MAC` | MAC of the slave lens (default `F2:65:0B:5B:EB:85`) |
 | | the firmware sets the top two bits of the first byte; the last three bytes end the advertised name |
-| `--timing serial\|accurate` | how the cores share time (default `serial`, see [Timing](#timing)) |
 | `--renode PATH` | Renode executable (otherwise `$RENODE`, `.renode/`, `PATH`) |
 
 # CLI Input/Ouput
@@ -81,7 +80,6 @@ Then navigate to: http://127.0.0.1:8340/
 | `--mac-master MAC` | MAC of the master lens (default `E9:A4:9E:29:70:D9`) |
 | `--mac-slave MAC` | MAC of the slave lens (default `F2:65:0B:5B:EB:85`) |
 | | the firmware sets the top two bits of the first byte; the last three bytes end the advertised name |
-| `--timing serial\|accurate` | how the cores share time (default `accurate` here, see [Timing](#timing)) |
 | `--renode PATH` | Renode executable (otherwise `$RENODE`, `.renode/`, `PATH`) |
 
 ## Frame Recording

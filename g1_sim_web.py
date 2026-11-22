@@ -12,11 +12,6 @@ display, touch bar, state, both UART consoles, the virtual phone with a box
 for the protocol packets it is to send, sensor inputs, a monitor command box
 and the GPIO pins.
 
-Unlike g1sim.py it runs with --timing accurate unless told otherwise: the net
-cores' timers and the radio link between the lenses are exact, so what a
-person does at the page meets the firmware's real radio timing
-(g1sim.TIMING_MODES, README "Timing"). 1.6.6 needs --timing serial.
-
 The server owns one headless Renode and talks to its monitor over a local
 TCP socket; UART output is read from Renode's log. It listens on the loopback
 interface only: the page can run any Renode monitor command.
@@ -479,9 +474,8 @@ class Frames:
 
 
 class Api:
-    def __init__(self, renode, firmware, frames, timing):
+    def __init__(self, renode, firmware, frames):
         self.renode = renode
-        self.timing = timing
         # lens -> what it runs, as g1sim.prepare_firmware describes it
         self.firmware = {lens: firmware[machine] for lens, machine in LENSES.items()}
         self.frames = frames
@@ -731,10 +725,7 @@ class Api:
         return result
 
     def set_quantum(self):
-        """The shorter time quantum while a phone is on (see g1sim.QUANTUM).
-        The accurate timing picks its quantum itself."""
-        if self.timing == "accurate":
-            return
+        """The shorter time quantum while a phone is on (see g1sim.QUANTUM)."""
         rn, phones = self.renode, 0
         for lens in LENSES:
             with rn.on(lens):
@@ -869,7 +860,7 @@ class Server(ThreadingHTTPServer):
 def main():
     parser = argparse.ArgumentParser(
         description="Run prebuilt Even Realities G1 firmware in Renode with a browser front end.")
-    g1sim.add_setup_arguments(parser, timing="accurate")
+    g1sim.add_setup_arguments(parser)
     parser.add_argument("--port", type=int, default=8340, metavar="N",
                         help="HTTP port on 127.0.0.1 (default 8340)")
     parser.add_argument("--paused", action="store_true",
@@ -897,7 +888,7 @@ def main():
         with open(session, "w") as f:
             f.write("\n".join(lines) + "\n")
 
-        print("g1_sim_web: starting Renode (%s timing) ..." % args.timing, flush=True)
+        print("g1_sim_web: starting Renode ...", flush=True)
         try:
             renode.start()
         except MonitorError as e:
@@ -906,7 +897,7 @@ def main():
                 sys.stderr.write("".join(f.readlines()[-25:]))
             sys.exit("g1_sim_web: %s (end of the Renode log is above)" % e)
 
-        Handler.api = Api(renode, firmware, frames, args.timing)
+        Handler.api = Api(renode, firmware, frames)
         Handler.renode = renode
         Handler.hosts = ("127.0.0.1:%d" % args.port, "localhost:%d" % args.port)
         try:
